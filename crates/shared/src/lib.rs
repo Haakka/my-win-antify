@@ -6,14 +6,19 @@ pub use error::{IpcError, IpcErrorCode};
 pub use ipc::{
     IpcEvent, IpcRequest, IpcResponse, PipeConnectionState, PongInfo, RpcRequest, RpcResult,
     ServerFrame, CONFIG_SCHEMA_VERSION, DEFAULT_PIPE_NAME, EVENT_ACTIVITY_LOG,
-    EVENT_CONFIG_CHANGED, EVENT_CONNECTION_EVENT, EVENT_PIPE_CONNECTION, EVENT_STATS_TICK,
-    EVENT_STATUS_CHANGED, IPC_PROTOCOL_VERSION,
+    EVENT_CONFIG_CHANGED, EVENT_CONNECTION_EVENT, EVENT_PIPE_CONNECTION,
+    EVENT_PROXY_TESTS_STALE, EVENT_STATS_TICK, EVENT_STATUS_CHANGED, EVENT_WIFI_CHANGED,
+    IPC_PROTOCOL_VERSION,
 };
 pub use models::{
-    ActivityLogEntry, AppConfig, ConnectionProtocol, ConnectionSnapshot, ConnectionState,
-    GeneralSettings, LogCategory, LogLevel, NetworkInterfaceInfo, Profile, ProxyAuth, ProxyConfig,
-    ProxyProtocol, ProxyTestResult, Rule, RuleAction, RuleMatchTick, RuleMatcher,
-    RunningProcessInfo, ServiceStatus, ThemeMode, TrafficStats,
+    ActivityLogEntry, AppConfig, AutomationConfig, CoexistenceConflict, ConfigBackupExport,
+    ConnectionProtocol, ConnectionSnapshot, ConnectionState, CurrentWifiInfo,
+    DiagnosticBundleSummary, GeneralSettings, LogCategory, LogLevel, NetworkInterfaceInfo,
+    Profile, ProxyAuth, ProxyConfig, ProxyHealthSnapshot, ProxyHealthStatus, ProxyProtocol,
+    ProxyTestResult, Rule, RuleAction, RuleMatchTick, RuleMatcher, RulesImportPreview,
+    RunningProcessInfo, ServiceStatus, ThemeMode, TrafficDimensionItem, TrafficHistoryBucket,
+    TrafficHistoryQuery, TrafficHistoryRange, TrafficHistoryResponse, TrafficStats,
+    WifiProfileRule,
 };
 
 #[cfg(test)]
@@ -87,6 +92,13 @@ mod tests {
                 rule_id: "r1".into(),
                 last_matched_at_ms: 1_700_000_000_000,
             }],
+            proxy_health: vec![ProxyHealthSnapshot {
+                proxy_id: "proxy-1".into(),
+                score: 95,
+                status: ProxyHealthStatus::Healthy,
+                last_error_code: None,
+                last_error: None,
+            }],
         }));
         let evt_json = serde_json::to_string(&evt).unwrap();
         assert!(evt_json.contains("\"frame\":\"event\""));
@@ -156,11 +168,13 @@ mod tests {
             allow_lan: true,
             udp_relay: false,
             fallback_direct: true,
+            skip_tls_verify: true,
             enabled: true,
         };
         let json = serde_json::to_string(&proxy).unwrap();
         assert!(json.contains("\"udpRelay\":false"));
         assert!(json.contains("\"fallbackDirect\":true"));
+        assert!(json.contains("\"skipTlsVerify\":true"));
         let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(proxy, decoded);
 
@@ -175,7 +189,91 @@ mod tests {
         assert!(parsed.udp_relay);
         assert!(!parsed.fallback_direct);
         assert!(!parsed.allow_lan);
+        assert!(!parsed.skip_tls_verify);
         assert!(parsed.enabled);
+    }
+
+    #[test]
+    fn p1_protocols_health_and_stale_event_roundtrip() {
+        for (proto, expected) in [
+            (ProxyProtocol::Http, "\"http\""),
+            (ProxyProtocol::Https, "\"https\""),
+            (ProxyProtocol::DirectInterface, "\"directInterface\""),
+        ] {
+            let json = serde_json::to_string(&proto).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(serde_json::from_str::<ProxyProtocol>(&json).unwrap(), proto);
+        }
+
+        let stale_event = ServerFrame::Event(IpcEvent::ProxyTestsStale);
+        let stale_json = serde_json::to_string(&stale_event).unwrap();
+        assert!(stale_json.contains("\"event\":\"proxyTestsStale\""));
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&stale_json).unwrap(),
+            stale_event
+        );
+
+        let test_res = ProxyTestResult {
+            proxy_id: "p1".into(),
+            reachable: true,
+            latency_ms: Some(42),
+            error: None,
+            checked_at_ms: 12345,
+            stale: true,
+        };
+        let test_json = serde_json::to_string(&test_res).unwrap();
+        assert!(test_json.contains("\"stale\":true"));
+        assert_eq!(
+            serde_json::from_str::<ProxyTestResult>(&test_json).unwrap(),
+            test_res
+        );
+    }
+
+    #[test]
+    fn p2_automation_history_conflicts_and_backup_roundtrip() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.schema_version, 2);
+        cfg.automation = AutomationConfig {
+            enabled: true,
+            wifi_rules: vec![WifiProfileRule {
+                id: "w1".into(),
+                ssid: "Corp-WiFi".into(),
+                profile_id: "default".into(),
+                enabled: true,
+            }],
+        };
+        let cfg_json = serde_json::to_string(&cfg).unwrap();
+        assert!(cfg_json.contains("\"wifiRules\""));
+        assert_eq!(serde_json::from_str::<AppConfig>(&cfg_json).unwrap(), cfg);
+
+        let query = IpcRequest {
+            id: 90,
+            request: RpcRequest::GetTrafficHistory {
+                query: TrafficHistoryQuery {
+                    range: TrafficHistoryRange::Last24h,
+                    profile_id: Some("default".into()),
+                },
+            },
+        };
+        let query_json = serde_json::to_string(&query).unwrap();
+        assert!(query_json.contains("\"range\":\"24h\""));
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&query_json).unwrap(),
+            query
+        );
+
+        let wifi_evt = ServerFrame::Event(IpcEvent::WifiChanged(CurrentWifiInfo {
+            supported: true,
+            connected: true,
+            ssid: Some("Office".into()),
+            interface_name: Some("WLAN".into()),
+        }));
+        let wifi_json = serde_json::to_string(&wifi_evt).unwrap();
+        assert!(wifi_json.contains("\"event\":\"wifiChanged\""));
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&wifi_json).unwrap(),
+            wifi_evt
+        );
     }
 
     #[test]
@@ -211,5 +309,47 @@ mod tests {
         assert!(clear_json.contains("\"method\":\"clearActivityLogs\""));
         let decoded_clear: IpcRequest = serde_json::from_str(&clear_json).unwrap();
         assert_eq!(clear_logs, decoded_clear);
+    }
+
+    #[test]
+    fn service_status_and_restore_backup_roundtrip_and_legacy_defaults() {
+        let legacy_status = r#"{
+            "running":false,
+            "uptimeSecs":0,
+            "servicePid":100,
+            "coreVersion":"0.1.0",
+            "driverReady":false,
+            "activeProfileId":"default"
+        }"#;
+        let parsed: ServiceStatus = serde_json::from_str(legacy_status).unwrap();
+        assert!(parsed.config_error.is_none());
+        assert!(parsed.invalid_rule_ids.is_empty());
+
+        let status = ServiceStatus {
+            running: false,
+            started_at_ms: None,
+            uptime_secs: 0,
+            service_pid: 42,
+            core_version: "0.2.0".into(),
+            driver_ready: true,
+            active_profile_id: "default".into(),
+            last_error: None,
+            config_error: Some("Corrupt config.json".into()),
+            invalid_rule_ids: vec!["rule-bad".into()],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"configError\":\"Corrupt config.json\""));
+        assert!(json.contains("\"invalidRuleIds\":[\"rule-bad\"]"));
+        let decoded: ServiceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(status, decoded);
+
+        let restore = IpcRequest {
+            id: 44,
+            request: RpcRequest::RestoreConfigBackup,
+        };
+        let restore_json = serde_json::to_string(&restore).unwrap();
+        assert!(restore_json.contains("\"method\":\"restoreConfigBackup\""));
+        let decoded_restore: IpcRequest = serde_json::from_str(&restore_json).unwrap();
+        assert_eq!(restore, decoded_restore);
     }
 }

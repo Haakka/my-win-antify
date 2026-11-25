@@ -1,6 +1,9 @@
-use std::{ffi::c_void, io, mem::size_of, ptr, sync::Arc, time::Duration};
+use std::{
+    ffi::c_void, io, mem::size_of, os::windows::io::AsRawHandle, path::PathBuf, ptr, sync::Arc,
+    time::Duration,
+};
 
-use shared::{IpcError, IpcErrorCode, IpcRequest, IpcResponse, ServerFrame};
+use shared::{IpcError, IpcErrorCode, IpcRequest, IpcResponse, RpcRequest, RpcResult, ServerFrame};
 use tokio::{
     io::{self as aio, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::windows::named_pipe::{NamedPipeServer, ServerOptions},
@@ -8,7 +11,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::service::Service;
+use crate::{config, service::Service};
 
 // Keep the standard authenticated-user, SYSTEM and administrator access, and
 // explicitly grant the creator read/write access when run in a restricted console.
@@ -25,6 +28,17 @@ struct SecurityAttributes {
 
 #[link(name = "advapi32")]
 extern "system" {
+    fn ImpersonateNamedPipeClient(pipe: isize) -> i32;
+    fn RevertToSelf() -> i32;
+    fn OpenThreadToken(thread: isize, access: u32, open_as_self: i32, token: *mut isize) -> i32;
+    fn SetThreadToken(thread: *const isize, token: isize) -> i32;
+    fn GetTokenInformation(
+        token: isize,
+        class: u32,
+        data: *mut c_void,
+        size: u32,
+        returned: *mut u32,
+    ) -> i32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
         sddl: *const u16,
         revision: u32,
@@ -36,6 +50,8 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    fn GetCurrentThread() -> isize;
+    fn CloseHandle(handle: isize) -> i32;
 }
 
 struct Descriptor(*mut c_void);
@@ -44,6 +60,110 @@ impl Drop for Descriptor {
     fn drop(&mut self) {
         unsafe { LocalFree(self.0) };
     }
+}
+
+struct Impersonation;
+
+impl Drop for Impersonation {
+    fn drop(&mut self) {
+        if unsafe { RevertToSelf() } == 0 {
+            // This thread cannot safely serve more requests with a client token.
+            std::process::abort();
+        }
+    }
+}
+
+struct ClientToken(isize);
+
+impl ClientToken {
+    fn from_pipe(pipe: isize) -> io::Result<Self> {
+        const TOKEN_QUERY_AND_IMPERSONATE: u32 = 0x0008 | 0x0004;
+        const TOKEN_IMPERSONATION_LEVEL: u32 = 9;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _guard = Impersonation;
+        let mut token = 0;
+        if unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY_AND_IMPERSONATE,
+                1,
+                &mut token,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Self(token);
+        let mut level = 0u32;
+        let mut size = 0;
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TOKEN_IMPERSONATION_LEVEL,
+                (&mut level as *mut u32).cast(),
+                size_of::<u32>() as u32,
+                &mut size,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if level < SECURITY_IMPERSONATION {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Client permits identification only",
+            ));
+        }
+        Ok(token)
+    }
+
+    fn with_identity<T>(&self, work: impl FnOnce() -> T) -> io::Result<T> {
+        if unsafe { SetThreadToken(ptr::null(), self.0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _guard = Impersonation;
+        Ok(work())
+    }
+}
+
+impl Drop for ClientToken {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn client_access(error: io::Error) -> IpcError {
+    IpcError::new(
+        IpcErrorCode::AccessDenied,
+        format!("Cannot use the diagnostic requester's identity: {error}"),
+    )
+}
+
+async fn dispatch(
+    service: &Arc<Service>,
+    pipe: isize,
+    request: RpcRequest,
+) -> Result<RpcResult, IpcError> {
+    if let RpcRequest::CollectDiagnosticBundle {
+        output_path: Some(path),
+    } = request
+    {
+        // Capture the last reader's token while the pipe is live. Only the scoped file
+        // write uses it, and impersonation never spans an await.
+        let token = ClientToken::from_pipe(pipe).map_err(client_access)?;
+        let bundle = service
+            .collect_diagnostics(Some(PathBuf::from(path)), move |path, bytes| {
+                token
+                    .with_identity(|| config::atomic_write(path, bytes))
+                    .map_err(client_access)?
+            })
+            .await?;
+        return Ok(RpcResult::DiagnosticBundle(bundle));
+    }
+    service.dispatch(request).await
 }
 
 pub(crate) fn create(name: &str, first: bool) -> io::Result<NamedPipeServer> {
@@ -108,6 +228,7 @@ pub(crate) async fn run(
 
 async fn serve(pipe: NamedPipeServer, service: Arc<Service>) -> io::Result<()> {
     let mut events = service.telemetry.events.subscribe();
+    let pipe_handle = pipe.as_raw_handle() as isize;
     let (read, mut write) = aio::split(pipe);
     let mut reader = BufReader::new(read);
     let (reply, mut replies) = mpsc::channel(32);
@@ -115,7 +236,7 @@ async fn serve(pipe: NamedPipeServer, service: Arc<Service>) -> io::Result<()> {
         let mut frame = Vec::new();
         while read_frame(&mut reader, &mut frame).await? {
             let response = match serde_json::from_slice::<IpcRequest>(&frame) {
-                Ok(request) => match service.dispatch(request.request).await {
+                Ok(request) => match dispatch(&service, pipe_handle, request.request).await {
                     Ok(result) => IpcResponse::ok(request.id, result),
                     Err(error) => IpcResponse::err(request.id, error),
                 },
@@ -185,7 +306,7 @@ async fn read_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::{AppConfig, IpcEvent, RpcRequest, RpcResult, IPC_PROTOCOL_VERSION};
+    use shared::{AppConfig, IpcEvent, IPC_PROTOCOL_VERSION};
     use tokio::net::windows::named_pipe::ClientOptions;
 
     #[tokio::test]
@@ -264,6 +385,58 @@ mod tests {
         listener.abort();
         ticker.abort();
         std::fs::remove_file(config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_diagnostic_path_requires_client_impersonation() {
+        const SECURITY_IMPERSONATION: u32 = 0x0002_0000;
+        let scope = format!(
+            "antify-diagnostic-pipe-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        );
+        let name = format!(r"\\.\pipe\{scope}");
+        let server = create(&name, true).unwrap();
+        let dir = std::env::temp_dir().join(scope);
+        let config_path = dir.join("config.json");
+        let path = dir.join("custom.json");
+        let service = Service::new(config_path.clone()).await.unwrap();
+        let listener_name = name.clone();
+        let listener = tokio::spawn(async move { run(&listener_name, server, service).await });
+        let request = || RpcRequest::CollectDiagnosticBundle {
+            output_path: Some(path.to_string_lossy().into_owned()),
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut identified = connect(&name).await;
+            send(&mut identified, 1, request()).await;
+            let ServerFrame::Response(denied) = recv(&mut identified).await else {
+                panic!("Expected a diagnostic response");
+            };
+            assert_eq!(denied.error.unwrap().code, IpcErrorCode::AccessDenied);
+            assert!(!path.exists());
+
+            let mut client = BufReader::new(
+                ClientOptions::new()
+                    .security_qos_flags(SECURITY_IMPERSONATION)
+                    .open(&name)
+                    .unwrap(),
+            );
+            send(&mut client, 2, request()).await;
+            let RpcResult::DiagnosticBundle(summary) = response(&mut client, 2).await else {
+                panic!("Expected a diagnostic bundle");
+            };
+            assert_eq!(PathBuf::from(summary.path), path);
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).is_ok()
+            );
+        })
+        .await
+        .unwrap();
+        listener.abort();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     type Client = BufReader<tokio::net::windows::named_pipe::NamedPipeClient>;

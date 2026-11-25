@@ -11,7 +11,8 @@ use std::{
 use shared::{
     IpcError, IpcErrorCode, IpcEvent, IpcRequest, IpcResponse, PipeConnectionState, RpcRequest,
     RpcResult, ServerFrame, DEFAULT_PIPE_NAME, EVENT_ACTIVITY_LOG, EVENT_CONFIG_CHANGED,
-    EVENT_CONNECTION_EVENT, EVENT_PIPE_CONNECTION, EVENT_STATS_TICK, EVENT_STATUS_CHANGED,
+    EVENT_CONNECTION_EVENT, EVENT_PIPE_CONNECTION, EVENT_PROXY_TESTS_STALE, EVENT_STATS_TICK,
+    EVENT_STATUS_CHANGED, EVENT_WIFI_CHANGED,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::{
@@ -189,6 +190,8 @@ async fn session(
                     }
                     IpcEvent::ActivityLog(payload) => emit(app, EVENT_ACTIVITY_LOG, payload),
                     IpcEvent::ConfigChanged(payload) => emit(app, EVENT_CONFIG_CHANGED, payload),
+                    IpcEvent::WifiChanged(payload) => emit(app, EVENT_WIFI_CHANGED, payload),
+                    IpcEvent::ProxyTestsStale => emit(app, EVENT_PROXY_TESTS_STALE, ()),
                 },
             }
         }

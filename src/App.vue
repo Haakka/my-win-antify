@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, watch } from "vue";
+import { onBeforeUnmount, onMounted, watch } from "vue";
 import { useAppStore } from "@/stores/app";
 import { useTheme } from "@/composables/useTheme";
+import { normalizeLocale } from "@/i18n";
 import type { Profile, ProxyConfig, Rule } from "@/types";
 import SidebarNav from "@/components/SidebarNav.vue";
 import OfflineBanner from "@/components/OfflineBanner.vue";
@@ -30,8 +31,27 @@ watch(
   { immediate: true },
 );
 
+watch(
+  () => store.config.settings.language,
+  (lang) => {
+    if (typeof document !== "undefined") {
+      document.documentElement.lang = normalizeLocale(lang);
+    }
+  },
+  { immediate: true },
+);
+
+function handleVisibilityChange() {
+  store.setDocumentHidden(document.hidden);
+}
+
 onMounted(() => {
+  document.addEventListener("visibilitychange", handleVisibilityChange);
   void store.init();
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
 });
 
 async function handleQuickSaveProxy(proxy: ProxyConfig) {

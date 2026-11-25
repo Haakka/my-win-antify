@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { onBeforeUnmount } from "vue";
 import { X } from "lucide-vue-next";
 
-defineProps<{
+const props = defineProps<{
   open: boolean;
   title: string;
   widthClass?: string;
@@ -10,6 +11,17 @@ defineProps<{
 const emit = defineEmits<{
   (e: "close"): void;
 }>();
+
+function onKeyDown(ev: KeyboardEvent) {
+  if (props.open && ev.key === "Escape") {
+    emit("close");
+  }
+}
+
+window.addEventListener("keydown", onKeyDown);
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeyDown);
+});
 </script>
 
 <template>

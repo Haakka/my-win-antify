@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   Activity,
+  AlertTriangle,
   ArrowDown,
   ArrowLeftRight,
   ArrowUp,
@@ -12,31 +13,60 @@ import {
   Plus,
   Power,
   Radio,
+  RotateCcw,
   Server,
   Sparkles,
   Square,
 } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
+import { useI18n } from "@/i18n";
 import { formatBps, formatUptime } from "@/utils/format";
+import OnboardingBanner from "@/components/OnboardingBanner.vue";
 
 const store = useAppStore();
+const { locale, t } = useI18n();
 
-const actionLabelMap = {
-  proxy: "代理",
-  direct: "直连",
-  block: "阻断",
-} as const;
+function actionLabel(action: "proxy" | "direct" | "block"): string {
+  return t(`common.${action}`);
+}
 </script>
 
 <template>
   <div class="space-y-4">
     <h1 class="text-[18px] font-semibold tracking-tight text-gray-900">
-      仪表盘
+      {{ t("dashboard.title") }}
     </h1>
+
+    <OnboardingBanner />
+
+    <!-- Corrupt Config Alert Banner -->
+    <div
+      v-if="store.status.configError"
+      class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-300/90 bg-red-50 px-4 py-3 text-[12.5px] text-red-800 dark:border-red-500/35 dark:bg-red-950/35 dark:text-red-200"
+    >
+      <div class="flex min-w-0 items-start gap-2.5">
+        <AlertTriangle class="mt-0.5 h-4.5 w-4.5 shrink-0 text-red-600 dark:text-red-400" />
+        <div class="min-w-0">
+          <div class="font-semibold">{{ t("dashboard.configErrorTitle") }}</div>
+          <div class="mt-0.5 break-all text-[12px] opacity-90">
+            {{ store.status.configError }}
+          </div>
+        </div>
+      </div>
+      <button
+        type="button"
+        :disabled="store.busySaving"
+        class="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-[12px] font-medium text-white transition hover:bg-red-700 disabled:opacity-50"
+        @click="store.restoreConfigBackup()"
+      >
+        <RotateCcw class="h-3.5 w-3.5" />
+        {{ t("dashboard.restoreBackup") }}
+      </button>
+    </div>
 
     <!-- Top Status Banner -->
     <div
-      class="flex items-center justify-between rounded-2xl border px-5 py-4 transition-colors"
+      class="flex items-center justify-between gap-3 rounded-2xl border px-5 py-4 transition-colors"
       :class="
         store.status.running
           ? 'border-emerald-200/80 bg-[#EAF9F0] dark:border-emerald-500/25 dark:bg-[#15241D]'
@@ -45,7 +75,7 @@ const actionLabelMap = {
     >
       <div class="flex items-center gap-3.5">
         <div
-          class="flex h-11 w-11 items-center justify-center rounded-xl"
+          class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl"
           :class="
             store.status.running
               ? 'bg-emerald-500/15 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400'
@@ -57,13 +87,13 @@ const actionLabelMap = {
         </div>
         <div>
           <div class="text-[15px] font-semibold text-gray-900">
-            {{ store.status.running ? "代理已启用" : "代理未启用" }}
+            {{ store.status.running ? t("dashboard.proxyActive") : t("dashboard.proxyInactive") }}
           </div>
           <div class="text-[12.5px] text-gray-500">
             {{
               store.status.running
-                ? "已配置应用的流量通过 WinDivert 透明反射路由。"
-                : "点击右侧启动按钮开始接管配置应用的出站流量。"
+                ? t("dashboard.proxyActiveDesc")
+                : t("dashboard.proxyInactiveDesc")
             }}
           </div>
         </div>
@@ -71,8 +101,12 @@ const actionLabelMap = {
 
       <button
         type="button"
-        :disabled="store.busyEngine || !store.isServiceConnected"
-        class="inline-flex items-center gap-2 rounded-full px-5 py-2 text-[13px] font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
+        :disabled="
+          store.busyEngine ||
+          !store.isServiceConnected ||
+          Boolean(store.status.configError)
+        "
+        class="inline-flex shrink-0 items-center gap-2 rounded-full px-5 py-2 text-[13px] font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
         :class="
           store.status.running
             ? 'bg-gray-200/90 text-gray-800 hover:bg-gray-300/80 dark:bg-[#2A2E38] dark:text-gray-100 dark:hover:bg-[#353A47]'
@@ -85,12 +119,12 @@ const actionLabelMap = {
           class="h-3 w-3 fill-current"
         />
         <Play v-else class="h-3.5 w-3.5 fill-current" />
-        <span>{{ store.status.running ? "停止" : "启动" }}</span>
+        <span>{{ store.status.running ? t("dashboard.stop") : t("dashboard.start") }}</span>
       </button>
     </div>
 
     <!-- Middle 3-Column Feature Cards -->
-    <div class="grid grid-cols-3 gap-4">
+    <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
       <!-- General / Active Profile Card -->
       <div
         class="antify-card flex cursor-pointer flex-col justify-between p-4 transition hover:border-gray-300"
@@ -110,9 +144,9 @@ const actionLabelMap = {
         <div
           class="antify-inset mt-5 flex items-center justify-between px-3 py-2 text-[12.5px]"
         >
-          <span class="text-gray-500">默认</span>
+          <span class="text-gray-500">{{ t("dashboard.defaultPolicy") }}</span>
           <span class="font-medium text-gray-800">
-            {{ actionLabelMap[store.activeProfile.defaultAction] }}
+            {{ actionLabel(store.activeProfile.defaultAction) }}
           </span>
         </div>
       </div>
@@ -129,27 +163,44 @@ const actionLabelMap = {
             >
               <Radio class="h-4.5 w-4.5" />
             </div>
-            <div class="text-[14px] font-semibold text-gray-900">自动化</div>
+            <div class="text-[14px] font-semibold text-gray-900">
+              {{ t("dashboard.automation") }}
+            </div>
           </div>
           <span
-            class="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2.5 py-0.5 text-[11px] font-medium text-gray-500"
+            class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium"
+            :class="
+              store.config.automation.enabled
+                ? 'bg-emerald-100/80 text-emerald-700'
+                : 'bg-gray-100 text-gray-500'
+            "
           >
-            M2 规划
+            {{
+              store.config.automation.enabled
+                ? `${t("dashboard.autoOn")} (${store.config.automation.wifiRules.filter((r) => r.enabled).length})`
+                : t("dashboard.autoOff")
+            }}
           </span>
         </div>
 
         <div
           class="antify-inset mt-5 flex items-center justify-between px-3 py-2 text-[12.5px]"
         >
-          <span class="text-gray-500">Wi-Fi 网络</span>
-          <span class="font-medium text-gray-700">无 Wi-Fi 规则</span>
+          <span class="text-gray-500">{{ t("dashboard.wifiNetwork") }}</span>
+          <span class="truncate font-medium text-gray-700">
+            {{
+              store.currentWifi.connected && store.currentWifi.ssid
+                ? store.currentWifi.ssid
+                : store.config.automation.wifiRules.length > 0
+                  ? t("dashboard.wifiRuleCount", { count: store.config.automation.wifiRules.length })
+                  : t("dashboard.noWifiRules")
+            }}
+          </span>
         </div>
       </div>
 
       <!-- Realtime Telemetry Card -->
-      <div
-        class="antify-card flex flex-col justify-between p-4"
-      >
+      <div class="antify-card flex flex-col justify-between p-4">
         <div class="flex items-center justify-between gap-2">
           <div class="flex items-center gap-2.5">
             <div
@@ -157,7 +208,9 @@ const actionLabelMap = {
             >
               <Activity class="h-4.5 w-4.5" />
             </div>
-            <div class="text-[14px] font-semibold text-gray-900">实时</div>
+            <div class="text-[14px] font-semibold text-gray-900">
+              {{ t("dashboard.realtime") }}
+            </div>
           </div>
 
           <span
@@ -170,8 +223,8 @@ const actionLabelMap = {
           >
             {{
               store.status.running
-                ? `运行 ${formatUptime(store.stats.uptimeSecs)}`
-                : "未运行"
+                ? t("dashboard.runningUptime", { uptime: formatUptime(store.stats.uptimeSecs, locale) })
+                : t("dashboard.notRunning")
             }}
           </span>
         </div>
@@ -184,7 +237,7 @@ const actionLabelMap = {
           >
             <span class="inline-flex items-center gap-1 text-[11.5px] text-gray-500">
               <ArrowLeftRight class="h-3 w-3 text-[#0A7AFF]" />
-              连接
+              {{ t("dashboard.connections") }}
             </span>
             <span class="mt-0.5 text-[20px] font-bold leading-tight text-[#0A7AFF]">
               {{ store.stats.activeConnections }}
@@ -198,7 +251,7 @@ const actionLabelMap = {
           >
             <span class="inline-flex items-center gap-1 text-[11.5px] text-gray-500">
               <Sparkles class="h-3 w-3 text-[#A855F7]" />
-              应用
+              {{ t("dashboard.apps") }}
             </span>
             <span class="mt-0.5 text-[20px] font-bold leading-tight text-[#A855F7]">
               {{ store.stats.activeApps }}
@@ -206,9 +259,7 @@ const actionLabelMap = {
           </button>
         </div>
 
-        <div
-          class="mt-2 flex items-center justify-between px-1 text-[11px] text-gray-400"
-        >
+        <div class="mt-2 flex items-center justify-between px-1 text-[11px] text-gray-400">
           <span class="inline-flex items-center gap-1">
             <ArrowUp class="h-3 w-3 text-orange-500" />
             {{ formatBps(store.stats.uploadBps) }}
@@ -228,14 +279,12 @@ const actionLabelMap = {
         @click="store.activeRoute = 'proxies'"
       >
         <div class="flex items-center justify-between">
-          <div
-            class="flex h-7 w-7 items-center justify-center rounded-lg bg-[#0A7AFF] text-white"
-          >
+          <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-[#0A7AFF] text-white">
             <Server class="h-4 w-4" />
           </div>
           <button
             type="button"
-            title="新增代理"
+            :title="t('dashboard.addProxyTitle')"
             class="flex h-6 w-6 items-center justify-center rounded-full bg-gray-100 text-gray-500 transition hover:bg-gray-200 hover:text-gray-800"
             @click.stop="store.quickAddProxyOpen = true"
           >
@@ -246,7 +295,7 @@ const actionLabelMap = {
           <div class="text-[24px] font-bold leading-none text-gray-900">
             {{ store.config.proxies.length }}
           </div>
-          <div class="mt-1.5 text-[12px] text-gray-500">代理</div>
+          <div class="mt-1.5 text-[12px] text-gray-500">{{ t("dashboard.proxies") }}</div>
         </div>
       </div>
 
@@ -255,14 +304,12 @@ const actionLabelMap = {
         @click="store.activeRoute = 'rules'"
       >
         <div class="flex items-center justify-between">
-          <div
-            class="flex h-7 w-7 items-center justify-center rounded-lg bg-[#AF52DE] text-white"
-          >
+          <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-[#AF52DE] text-white">
             <ListChecks class="h-4 w-4" />
           </div>
           <button
             type="button"
-            title="新增规则"
+            :title="t('dashboard.addRuleTitle')"
             class="flex h-6 w-6 items-center justify-center rounded-full bg-gray-100 text-gray-500 transition hover:bg-gray-200 hover:text-gray-800"
             @click.stop="store.quickAddRuleOpen = true"
           >
@@ -273,7 +320,7 @@ const actionLabelMap = {
           <div class="text-[24px] font-bold leading-none text-gray-900">
             {{ store.activeProfileRules.length }}
           </div>
-          <div class="mt-1.5 text-[12px] text-gray-500">规则</div>
+          <div class="mt-1.5 text-[12px] text-gray-500">{{ t("dashboard.rules") }}</div>
         </div>
       </div>
 
@@ -282,14 +329,12 @@ const actionLabelMap = {
         @click="store.activeRoute = 'profiles'"
       >
         <div class="flex items-center justify-between">
-          <div
-            class="flex h-7 w-7 items-center justify-center rounded-lg bg-[#FF9500] text-white"
-          >
+          <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-[#FF9500] text-white">
             <Layers class="h-4 w-4" />
           </div>
           <button
             type="button"
-            title="新增配置"
+            :title="t('dashboard.addProfileTitle')"
             class="flex h-6 w-6 items-center justify-center rounded-full bg-gray-100 text-gray-500 transition hover:bg-gray-200 hover:text-gray-800"
             @click.stop="store.quickAddProfileOpen = true"
           >
@@ -300,7 +345,7 @@ const actionLabelMap = {
           <div class="text-[24px] font-bold leading-none text-gray-900">
             {{ store.config.profiles.length }}
           </div>
-          <div class="mt-1.5 text-[12px] text-gray-500">配置</div>
+          <div class="mt-1.5 text-[12px] text-gray-500">{{ t("dashboard.profiles") }}</div>
         </div>
       </div>
     </div>

@@ -34,11 +34,11 @@ Again: **MyWinAntify is far from complete** and exists **for learning and person
 > On first launch, the app automatically initializes an empty default configuration at `%ProgramData%\MyWinAntify\config.json` on your own machine.
 
 ### Quick Start
-1. Download `MyWinAntify-v0.1.0-win-x64.zip` from the [Releases](../../releases) page.
+1. Download `MyWinAntify-v0.5.0-win-x64.zip` from the [Releases](../../releases) page.
 2. **Extract the entire folder** to a local directory (do not run directly from inside the ZIP preview).
 3. Double-click `MyWinAntify.exe`.
    - On launch, Windows will show a **UAC elevation prompt** so the desktop UI can silently start the background traffic engine (`core-service.exe`) and load the signed `WinDivert64.sys` driver (no console window).
-4. **Add an Upstream Proxy**: Go to **Proxies** (`代理`) -> click `+` -> add your local or self-hosted SOCKS5 endpoint (for example, `127.0.0.1:7890` exposed by Clash / FlClash / v2rayN).
+4. **Add an Upstream Proxy**: Go to **Proxies** (`代理`) -> click `+` -> add your local or self-hosted `SOCKS5 / HTTP / HTTPS / Direct Interface` endpoint (for example, `127.0.0.1:7890` exposed by Clash / FlClash / v2rayN).
 5. **Add App Rules**: Go to **Rules** (`规则`) -> click `+` -> either browse for a `.exe` executable or pick directly from currently running processes, and assign `Proxy`, `Direct`, or `Block`.
 6. **Start Routing**: Go back to **Dashboard** (`仪表盘`) and click **Start** (`启动`). Matched apps will route through your chosen upstream proxy while other apps stay direct.
 7. **Clean Exit**: Clicking the window close button (`X`) minimizes MyWinAntify to the system tray so proxying continues in the background. To completely stop the engine and restore direct networking, **right-click the system tray icon and choose Exit (`退出 MyWinAntify`)**.
@@ -50,24 +50,25 @@ Again: **MyWinAntify is far from complete** and exists **for learning and person
 
 ---
 
-## Current Features (v0.1.0)
+## Current Features (v0.5.0)
 
-- **No Virtual NIC (Non-TUN)**: Uses official signed **WinDivert 2.2.2-A** (`FLOW` + `NETWORK` reflection) rather than Wintun/TAP adapters, coexisting cleanly with Clash, FlClash, v2rayN, or VPN tools.
-- **Per-App & Path Rule Matching**: Match by executable path, process name, or directory, with optional target host/IP/port filters and `Proxy` / `Direct` / `Block` (fast TCP RST fail) actions.
-- **Child Process Inheritance (`includeChildren`)**: Traces parent process chains so child processes spawned by IDEs or terminals (e.g., language servers, `node.exe`, `curl.exe`) automatically inherit parent rules.
-- **Network Lock (`networkLock`)**: Prevents traffic leaks by immediately closing connections instead of falling back to direct when an upstream proxy is unreachable.
-- **Domain Sniffing (`TLS SNI` / `HTTP Host`)**: Non-destructively peeks the initial packet in the local Tokio relay to extract SNI / `Host` headers, display domains in the Connections view, and send domain addresses (`ATYP = 0x03`) during SOCKS5 `CONNECT`.
+- **No Virtual NIC (Non-TUN)**: Uses official signed **WinDivert 2.2.2-A** (`FLOW` + `NETWORK` reflection) rather than Wintun/TAP adapters, coexisting cleanly with Clash, FlClash, v2rayN, or VPN tools. Intercepts IPv4 TCP + UDP (`SOCKS5 UDP ASSOCIATE` with automatic DNS-over-TCP fallback when upstream lacks UDP relay) and applies fast TCP RST fallback on IPv6.
+- **Multiple Upstream Protocols**: Supports `SOCKS5`, `HTTP CONNECT`, `HTTPS CONNECT` (with TLS certificate verification and explicit `skipTlsVerify` opt-out), and `Direct Interface` (binding outbound connections directly to a selected local NIC).
+- **Fine-Grained Routing & Safety**: Match by executable path, process name, or directory, with target host/IP/port filters (`-` exclusions), child process inheritance (`includeChildren`), "Keep Real IP" (`bypassHosts`), `allowLan` private-network control, `networkLock`, Fail-Closed malformed rule protection, 3-slot rolling config backups with corruption recovery, and instant cancellation on engine stop or rule hot reload.
+- **Health Scoring & Auto-Recovery**: Real-traffic proxy health scoring and end-to-end latency probing, plus automatic recovery across Windows sleep/resume (`PBT_APMRESUMEAUTOMATIC`) and network adapter changes.
+- **Automation, History & Diagnostics**: Windows Wi-Fi SSID automatic profile switching, 24-hour and monthly persistent traffic history charts, full config backup/restore and portable rule JSON import/export (`%USERPROFILE%` path sanitization), system proxy / TUN coexistence conflict detection, and scrubbed diagnostic bundle export.
+- **Domain Sniffing (`TLS SNI` / `HTTP Host`)**: Non-destructively peeks the initial packet in the local Tokio relay to extract SNI / `Host` headers, display domains in the Connections view, and send domain addresses (`ATYP = 0x03`) during upstream handshakes.
 - **Privilege Separation**: `core-service.exe` runs elevated and enforces a single-writer config model (`%ProgramData%\MyWinAntify\config.json`), while the Tauri 2 desktop UI runs unprivileged over a DACL-protected Named Pipe (`\\.\pipe\my-win-antify-core-v1`).
-- **UI & Preview Mode**: Light/Dark/System themes, multiple accent skins, live connection stream, and an offline **Mock Preview** toggle in the sidebar for UI exploration without running the privileged service.
+- **Desktop UX & Bilingual i18n**: Single-instance launch guard, optional launch at login, drag-to-reorder rules & proxies, connection routing diagnostics with 10-minute auto-off Explore mode, per-second deduplicated selectable activity logs, collapsible sidebar & narrow-window layout, low-CPU tray sleep mode, first-run onboarding guide, built-in third-party licenses viewer, and live English / 简体中文 switching.
 
 ---
 
 ## Current Limitations (Why It Is Incomplete)
 
-This is an **early v0.1.0 learning prototype** with notable gaps:
-1. **IPv4 TCP + SOCKS5 Only**: UDP (`SOCKS5 UDP ASSOCIATE`), IPv6 traffic interception, and upstream HTTP CONNECT proxies are not implemented yet.
-2. **Placeholder Views**: Historical traffic charts, Wi-Fi automation switching, config import/export, and Windows SCM service registration are incomplete or UI placeholders.
-3. **Edge Cases**: Complex multi-NIC setups, QUIC/UDP fallback apps, or certain anti-cheat/protected processes may hit unhandled edge cases.
+This is still a **personal learning prototype** with known limitations:
+1. **Not Production-Hardened**: While core features (P0–P3) are in place, edge cases and stability under diverse real-world workloads still need refinement.
+2. **IPv6 & Windows SCM Service**: IPv6 traffic for proxied rules currently uses TCP RST fallback to IPv4 rather than full IPv6 transparent relay, and Windows Service (SCM) registration is not yet implemented.
+3. **Edge Cases**: Complex multi-NIC setups, QUIC/UDP fallback apps, or certain anti-cheat/protected processes may still hit unhandled edge cases.
 
 ---
 
@@ -91,7 +92,7 @@ npm run build
 # 3. Run Rust workspace tests
 cargo test --workspace
 
-# 4. Build portable Windows x64 ZIP (outputs to release/MyWinAntify-v0.1.0-win-x64.zip)
+# 4. Build portable Windows x64 ZIP (outputs to release/MyWinAntify-v0.5.0-win-x64.zip)
 npm run package
 ```
 

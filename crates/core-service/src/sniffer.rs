@@ -6,13 +6,17 @@ use tokio::{
 };
 
 const PEEK_BYTES: usize = 8192;
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(60);
 const PEEK_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) async fn peek_domain(stream: &TcpStream) -> Option<String> {
+    let mut bytes = vec![0; PEEK_BYTES];
+    let mut len = timeout(FIRST_BYTE_TIMEOUT, stream.peek(&mut bytes))
+        .await
+        .ok()?
+        .ok()?;
     timeout(PEEK_TIMEOUT, async {
-        let mut bytes = vec![0; PEEK_BYTES];
         loop {
-            let len = stream.peek(&mut bytes).await.ok()?;
             let data = &bytes[..len];
             if data.is_empty() {
                 return None;
@@ -33,6 +37,7 @@ pub(crate) async fn peek_domain(stream: &TcpStream) -> Option<String> {
             }
             // Peek leaves the same bytes readable while subsequent TCP segments arrive.
             sleep(Duration::from_millis(8)).await;
+            len = stream.peek(&mut bytes).await.ok()?;
         }
     })
     .await
@@ -186,6 +191,18 @@ mod tests {
         }
         assert!(tls_sni(&client_hello(1)).is_none());
         assert!(tls_sni(b"get https://example.org").is_none());
+    }
+
+    #[tokio::test]
+    async fn silent_client_releases_server_first_relay_quickly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let start = std::time::Instant::now();
+        assert!(peek_domain(&stream).await.is_none());
+        assert!(start.elapsed() < Duration::from_millis(120));
     }
 
     #[tokio::test]

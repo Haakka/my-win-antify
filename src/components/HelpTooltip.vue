@@ -63,7 +63,19 @@ function toggleClick() {
   }
 }
 
+function onKeyDown(ev: KeyboardEvent) {
+  if (open.value && ev.key === "Escape") {
+    ev.preventDefault();
+    ev.stopPropagation();
+    ev.stopImmediatePropagation();
+    open.value = false;
+  }
+}
+
+window.addEventListener("keydown", onKeyDown, true);
+
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeyDown, true);
   cancelHide();
 });
 </script>

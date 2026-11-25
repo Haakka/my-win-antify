@@ -1,7 +1,9 @@
 use crate::error::IpcError;
 use crate::models::{
-    ActivityLogEntry, AppConfig, ConnectionSnapshot, NetworkInterfaceInfo, ProxyTestResult,
-    RunningProcessInfo, ServiceStatus, TrafficStats,
+    ActivityLogEntry, AppConfig, CoexistenceConflict, ConfigBackupExport, ConnectionSnapshot,
+    CurrentWifiInfo, DiagnosticBundleSummary, NetworkInterfaceInfo, ProxyTestResult,
+    RulesImportPreview, RunningProcessInfo, ServiceStatus, TrafficHistoryQuery,
+    TrafficHistoryResponse, TrafficStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +14,7 @@ pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\my-win-antify-core-v1";
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
 /// Configuration schema version stored in `config.json`.
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 /// Tauri WebView event names emitted by `src-tauri` bridge.
 pub const EVENT_STATUS_CHANGED: &str = "core://status-changed";
@@ -21,6 +23,8 @@ pub const EVENT_CONNECTION_EVENT: &str = "core://connection-event";
 pub const EVENT_ACTIVITY_LOG: &str = "core://activity-log";
 pub const EVENT_CONFIG_CHANGED: &str = "core://config-changed";
 pub const EVENT_PIPE_CONNECTION: &str = "core://pipe-connection";
+pub const EVENT_PROXY_TESTS_STALE: &str = "core://proxy-tests-stale";
+pub const EVENT_WIFI_CHANGED: &str = "core://wifi-changed";
 
 /// Handshake response metadata returned by `RpcRequest::Ping`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +55,7 @@ pub enum RpcRequest {
     SaveConfig {
         config: AppConfig,
     },
+    RestoreConfigBackup,
     SetActiveProfile {
         profile_id: String,
     },
@@ -71,6 +76,36 @@ pub enum RpcRequest {
         limit: Option<u32>,
     },
     ClearActivityLogs,
+    ExportConfigBackup {
+        #[serde(default)]
+        include_passwords: bool,
+    },
+    ImportConfigBackup {
+        json: String,
+    },
+    ExportRulesJson {
+        #[serde(default)]
+        profile_id: Option<String>,
+    },
+    ImportRulesJson {
+        json: String,
+        profile_id: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    GetTrafficHistory {
+        query: TrafficHistoryQuery,
+    },
+    ClearTrafficHistory,
+    GetCurrentWifi,
+    GetCoexistenceConflicts,
+    DismissCoexistenceConflict {
+        conflict_id: String,
+    },
+    CollectDiagnosticBundle {
+        #[serde(default)]
+        output_path: Option<String>,
+    },
 }
 
 /// Typed result payload inside `IpcResponse`.
@@ -85,6 +120,13 @@ pub enum RpcResult {
     NetworkInterfaces(Vec<NetworkInterfaceInfo>),
     ProxyTest(ProxyTestResult),
     ActivityLogs(Vec<ActivityLogEntry>),
+    ConfigBackup(ConfigBackupExport),
+    RulesJson(String),
+    RulesImport(RulesImportPreview),
+    TrafficHistory(TrafficHistoryResponse),
+    CurrentWifi(CurrentWifiInfo),
+    CoexistenceConflicts(Vec<CoexistenceConflict>),
+    DiagnosticBundle(DiagnosticBundleSummary),
     Ack,
 }
 
@@ -129,6 +171,8 @@ pub enum IpcEvent {
     ConnectionEvent(ConnectionSnapshot),
     ActivityLog(ActivityLogEntry),
     ConfigChanged(AppConfig),
+    ProxyTestsStale,
+    WifiChanged(CurrentWifiInfo),
 }
 
 /// Top-level NDJSON frame sent from `core-service` to `src-tauri`.

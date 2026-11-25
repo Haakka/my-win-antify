@@ -1,13 +1,22 @@
 import type {
   ActivityLogEntry,
   AppConfig,
+  CoexistenceConflict,
+  ConfigBackupExport,
   ConnectionSnapshot,
+  CurrentWifiInfo,
+  DiagnosticBundleSummary,
   NetworkInterfaceInfo,
   PipeConnectionState,
   PongInfo,
   ProxyTestResult,
+  Rule,
+  RulesImportPreview,
   RunningProcessInfo,
   ServiceStatus,
+  TrafficHistoryBucket,
+  TrafficHistoryQuery,
+  TrafficHistoryResponse,
   TrafficStats,
 } from "@/types";
 import type { CoreClient, CoreEventCallbacks } from "./coreClient";
@@ -19,7 +28,7 @@ function clone<T>(val: T): T {
 const now = Date.now();
 
 const INITIAL_CONFIG: AppConfig = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   activeProfileId: "default",
   profiles: [
     {
@@ -41,6 +50,7 @@ const INITIAL_CONFIG: AppConfig = {
       allowLan: false,
       udpRelay: true,
       fallbackDirect: false,
+      skipTlsVerify: false,
       enabled: true,
     },
   ],
@@ -141,6 +151,17 @@ const INITIAL_CONFIG: AppConfig = {
     recordConnections: true,
     discoverUnmatched: false,
   },
+  automation: {
+    enabled: false,
+    wifiRules: [
+      {
+        id: "wifi-office",
+        ssid: "Studio-5G",
+        profileId: "default",
+        enabled: true,
+      },
+    ],
+  },
 };
 
 const SAMPLE_PROCESSES: RunningProcessInfo[] = [
@@ -205,6 +226,23 @@ export class MockCoreClient implements CoreClient {
   private nextLogId = 20;
   private timer: number | null = null;
   private callbacks: CoreEventCallbacks | null = null;
+  private mockWifi: CurrentWifiInfo = {
+    supported: true,
+    connected: true,
+    ssid: "Studio-5G",
+    interfaceName: "WLAN",
+  };
+  private mockConflicts: CoexistenceConflict[] = [
+    {
+      id: "sys-proxy",
+      kind: "systemProxy",
+      severity: "warn",
+      title: "检测到 Windows 系统代理已开启",
+      detail: "127.0.0.1:7890 当前已设为系统代理，通常可与本工具按应用分流共存，如遇重复代理请检查规则。",
+      dismissed: false,
+    },
+  ];
+  private historyCleared = false;
 
   private connections: ConnectionSnapshot[] = [
     {
@@ -228,17 +266,19 @@ export class MockCoreClient implements CoreClient {
       bytesUp: 48_210,
       bytesDown: 192_440,
       error: null,
+      matchReason: "命中规则「Antigravity」",
+      failureCode: null,
     },
     {
       id: 94,
       timestampMs: now - 9000,
-      protocol: "tcp",
+      protocol: "udp",
       pid: 8820,
       processName: "curl.exe",
       executablePath: "C:\\Windows\\System32\\curl.exe",
       appName: "Windows Terminal",
       srcAddr: "192.168.1.24:54288",
-      dstAddr: "140.82.114.4:443",
+      dstAddr: "8.8.8.8:53",
       domain: "api.github.com",
       action: "proxy",
       ruleId: "rule-terminal",
@@ -246,9 +286,11 @@ export class MockCoreClient implements CoreClient {
       proxyId: "proxy-flclash",
       proxyName: "FlClash",
       state: "closed",
-      bytesUp: 2_310,
-      bytesDown: 18_900,
+      bytesUp: 96,
+      bytesDown: 184,
       error: null,
+      matchReason: "DNS-over-TCP 经代理转发",
+      failureCode: null,
     },
     {
       id: 93,
@@ -271,6 +313,8 @@ export class MockCoreClient implements CoreClient {
       bytesUp: 4_120,
       bytesDown: 12_880,
       error: null,
+      matchReason: "未命中规则，按默认策略直连",
+      failureCode: null,
     },
   ];
 
@@ -306,6 +350,7 @@ export class MockCoreClient implements CoreClient {
     callbacks.onPipeState("connected");
     callbacks.onStatusChanged(await this.getStatus());
     callbacks.onStatsTick(this.buildStats());
+    callbacks.onWifiChanged(clone(this.mockWifi));
 
     this.timer = window.setInterval(() => {
       if (!this.callbacks) return;
@@ -339,6 +384,8 @@ export class MockCoreClient implements CoreClient {
             bytesUp: 1_240,
             bytesDown: 4_820,
             error: null,
+            matchReason: "命中规则「Antigravity」",
+            failureCode: null,
           };
           this.connections.unshift(sample);
           if (this.connections.length > 80) {
@@ -395,6 +442,13 @@ export class MockCoreClient implements CoreClient {
             { ruleId: "rule-chatgpt", lastMatchedAtMs: ts - 660_000 },
           ]
         : [],
+      proxyHealth: this.config.proxies.map((p) => ({
+        proxyId: p.id,
+        score: p.enabled ? 100 : 0,
+        status: p.enabled ? ("healthy" as const) : ("unknown" as const),
+        lastErrorCode: null,
+        lastError: null,
+      })),
     };
   }
 
@@ -419,10 +473,12 @@ export class MockCoreClient implements CoreClient {
           ? Math.floor((Date.now() - this.startedAtMs) / 1000)
           : 0,
       servicePid: 9999,
-      coreVersion: "0.1.0-mock",
+      coreVersion: "0.2.0-mock",
       driverReady: true,
       activeProfileId: this.config.activeProfileId,
       lastError: null,
+      configError: null,
+      invalidRuleIds: [],
     };
   }
 
@@ -452,6 +508,13 @@ export class MockCoreClient implements CoreClient {
     this.config = clone(config);
     this.callbacks?.onConfigChanged(clone(this.config));
     this.emitLog("info", "app", "Configuration Updated", `Profile "${this.config.activeProfileId}"`);
+    return clone(this.config);
+  }
+
+  async restoreConfigBackup(): Promise<AppConfig> {
+    this.callbacks?.onConfigChanged(clone(this.config));
+    this.callbacks?.onStatusChanged(await this.getStatus());
+    this.emitLog("info", "app", "Configuration Restored From Backup", null);
     return clone(this.config);
   }
 
@@ -509,6 +572,7 @@ export class MockCoreClient implements CoreClient {
           latencyMs: 18 + Math.floor(Math.random() * 35),
           error: null,
           checkedAtMs: Date.now(),
+          stale: false,
         }
       : {
           proxyId,
@@ -516,6 +580,7 @@ export class MockCoreClient implements CoreClient {
           latencyMs: null,
           error: "Proxy not found",
           checkedAtMs: Date.now(),
+          stale: false,
         };
     return result;
   }
@@ -531,6 +596,202 @@ export class MockCoreClient implements CoreClient {
 
   async launchService(): Promise<boolean> {
     return true;
+  }
+
+  async exportConfigBackup(includePasswords: boolean): Promise<ConfigBackupExport> {
+    const exported = clone(this.config);
+    if (!includePasswords) {
+      for (const p of exported.proxies) {
+        if (p.auth) {
+          p.auth = { username: p.auth.username, password: "" };
+        }
+      }
+    }
+    return {
+      json: JSON.stringify(exported, null, 2),
+      includesPasswords: includePasswords,
+      warning: includePasswords
+        ? "此备份包含明文代理密码，请妥善加密或离线保管。"
+        : null,
+    };
+  }
+
+  async importConfigBackup(json: string): Promise<AppConfig> {
+    const parsed = JSON.parse(json) as AppConfig;
+    if (!parsed || !Array.isArray(parsed.profiles) || parsed.profiles.length === 0) {
+      throw new Error("备份文件缺少有效的配置列表");
+    }
+    if (!parsed.profiles.some((p) => p.id === parsed.activeProfileId)) {
+      parsed.activeProfileId = parsed.profiles[0]!.id;
+    }
+    if (!parsed.automation) {
+      parsed.automation = { enabled: false, wifiRules: [] };
+    }
+    parsed.schemaVersion = 2;
+    this.config = clone(parsed);
+    this.callbacks?.onConfigChanged(clone(this.config));
+    this.emitLog("info", "app", "已从备份导入配置", null);
+    return clone(this.config);
+  }
+
+  async exportRulesJson(profileId: string | null): Promise<string> {
+    const pid = profileId ?? this.config.activeProfileId;
+    const rules = this.config.rules
+      .filter((r) => r.profileId === pid)
+      .map((r) => {
+        const next = clone(r);
+        if (next.matcher.kind === "executablePath") {
+          next.matcher.path = next.matcher.path.replace(/^C:\\Users\\[^\\]+/i, "%USERPROFILE%");
+        } else if (next.matcher.kind === "directory") {
+          next.matcher.dir = next.matcher.dir.replace(/^C:\\Users\\[^\\]+/i, "%USERPROFILE%");
+        }
+        return next;
+      });
+    return JSON.stringify(rules, null, 2);
+  }
+
+  async importRulesJson(
+    json: string,
+    profileId: string,
+    dryRun: boolean,
+  ): Promise<RulesImportPreview> {
+    const incoming = JSON.parse(json) as Rule[];
+    if (!Array.isArray(incoming)) {
+      throw new Error("规则 JSON 格式无效，应为数组");
+    }
+    const existingKeys = new Set(
+      this.config.rules
+        .filter((r) => r.profileId === profileId)
+        .map((r) => `${r.matcher.kind}:${JSON.stringify(r.matcher).toLowerCase()}`),
+    );
+    const proxyIds = new Set(this.config.proxies.map((p) => p.id));
+    const added: string[] = [];
+    const skippedDuplicates: string[] = [];
+    const missingProxyRules: string[] = [];
+
+    for (const raw of incoming) {
+      const rule = clone(raw);
+      rule.profileId = profileId;
+      const key = `${rule.matcher.kind}:${JSON.stringify(rule.matcher).toLowerCase()}`;
+      if (existingKeys.has(key)) {
+        skippedDuplicates.push(rule.name);
+        continue;
+      }
+      if (rule.action === "proxy" && rule.proxyId && !proxyIds.has(rule.proxyId)) {
+        missingProxyRules.push(rule.name);
+      }
+      added.push(rule.name);
+      if (!dryRun) {
+        this.config.rules.push(rule);
+      }
+    }
+    if (!dryRun && added.length > 0) {
+      this.callbacks?.onConfigChanged(clone(this.config));
+    }
+    return {
+      committed: !dryRun,
+      totalInFile: incoming.length,
+      added,
+      skippedDuplicates,
+      missingProxyRules,
+    };
+  }
+
+  async getTrafficHistory(query: TrafficHistoryQuery): Promise<TrafficHistoryResponse> {
+    if (this.historyCleared) {
+      return {
+        range: query.range,
+        profileId: query.profileId,
+        totalProxiedUp: 0,
+        totalProxiedDown: 0,
+        totalDirectUp: 0,
+        totalDirectDown: 0,
+        buckets: [],
+        topRules: [],
+        topProxies: [],
+        topApps: [],
+      };
+    }
+    const count = query.range === "24h" ? 24 : 30;
+    const stepMs = query.range === "24h" ? 3600_000 : 86400_000;
+    const nowMs = Date.now();
+    const buckets: TrafficHistoryBucket[] = [];
+    let totalProxiedUp = 0;
+    let totalProxiedDown = 0;
+    let totalDirectUp = 0;
+    let totalDirectDown = 0;
+    for (let i = count - 1; i >= 0; i--) {
+      const ts = nowMs - i * stepMs;
+      const d = new Date(ts);
+      const label =
+        query.range === "24h"
+          ? `${String(d.getHours()).padStart(2, "0")}:00`
+          : `${d.getMonth() + 1}/${d.getDate()}`;
+      const pu = 120_000 + ((i * 73_121) % 900_000);
+      const pd = 640_000 + ((i * 213_519) % 4_800_000);
+      const du = 24_000 + ((i * 19_001) % 140_000);
+      const dd = 85_000 + ((i * 51_007) % 420_000);
+      totalProxiedUp += pu;
+      totalProxiedDown += pd;
+      totalDirectUp += du;
+      totalDirectDown += dd;
+      buckets.push({
+        bucketStartMs: ts,
+        label,
+        proxiedUp: pu,
+        proxiedDown: pd,
+        directUp: du,
+        directDown: dd,
+      });
+    }
+    return {
+      range: query.range,
+      profileId: query.profileId,
+      totalProxiedUp,
+      totalProxiedDown,
+      totalDirectUp,
+      totalDirectDown,
+      buckets,
+      topRules: [
+        { key: "rule-antigravity", label: "Antigravity", upBytes: 12_400_000, downBytes: 84_200_000 },
+        { key: "rule-terminal", label: "Windows Terminal", upBytes: 3_100_000, downBytes: 14_800_000 },
+      ],
+      topProxies: [
+        { key: "proxy-flclash", label: "FlClash", upBytes: totalProxiedUp, downBytes: totalProxiedDown },
+      ],
+      topApps: [
+        { key: "antigravity.exe", label: "Antigravity", upBytes: 12_400_000, downBytes: 84_200_000 },
+        { key: "curl.exe", label: "curl", upBytes: 3_100_000, downBytes: 14_800_000 },
+      ],
+    };
+  }
+
+  async clearTrafficHistory(): Promise<void> {
+    this.historyCleared = true;
+  }
+
+  async getCurrentWifi(): Promise<CurrentWifiInfo> {
+    return clone(this.mockWifi);
+  }
+
+  async getCoexistenceConflicts(): Promise<CoexistenceConflict[]> {
+    return clone(this.mockConflicts.filter((c) => !c.dismissed));
+  }
+
+  async dismissCoexistenceConflict(conflictId: string): Promise<void> {
+    for (const c of this.mockConflicts) {
+      if (c.id === conflictId) c.dismissed = true;
+    }
+  }
+
+  async collectDiagnosticBundle(outputPath: string | null): Promise<DiagnosticBundleSummary> {
+    return {
+      path: outputPath ?? "C:\\ProgramData\\MyWinAntify\\diagnostics-mock.json",
+      generatedAtMs: Date.now(),
+      logCount: this.logs.length,
+      interfaceCount: 2,
+      sanitizedFields: ["proxyHost", "proxyCredentials", "wifiSsid", "userProfilePath"],
+    };
   }
 
   private emitLog(

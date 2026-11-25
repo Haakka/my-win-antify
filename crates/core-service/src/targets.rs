@@ -39,7 +39,7 @@ impl Targets {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Patterns<T> {
     allowed: Vec<T>,
     excluded: Vec<T>,
@@ -102,7 +102,7 @@ enum IpMatch {
     Inspect,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct HostPatterns(Patterns<Host>);
 
 impl HostPatterns {
@@ -133,6 +133,28 @@ impl HostPatterns {
 }
 
 #[derive(Debug)]
+pub(crate) struct BypassHosts(HostPatterns);
+
+impl BypassHosts {
+    pub fn parse(entries: &[String]) -> Result<Option<Arc<Self>>, String> {
+        let patterns = Patterns::parse(entries, "host", Host::parse)?;
+        Ok((!patterns.allowed.is_empty()).then(|| Arc::new(Self(HostPatterns(patterns)))))
+    }
+
+    pub fn matches_ip(&self, ip: Ipv4Addr) -> bool {
+        self.0.check_ip(ip) == IpMatch::Matched
+    }
+
+    pub fn needs_domain(&self, ip: Ipv4Addr) -> bool {
+        self.0.check_ip(ip) == IpMatch::Inspect
+    }
+
+    pub fn matches(&self, ip: Ipv4Addr, domain: Option<&str>) -> bool {
+        self.0.matches(ip, domain)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum Host {
     Ip(RangeInclusive<Ipv4Addr>),
     Domain { name: String, wildcard: bool },
@@ -204,6 +226,42 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bypass_requires_an_inclusion_and_respects_domain_and_ip_exclusions() {
+        assert!(BypassHosts::parse(&[]).unwrap().is_none());
+        assert!(BypassHosts::parse(&["-10.0.0.0/8".into()])
+            .unwrap()
+            .is_none());
+        let bypass = BypassHosts::parse(
+            &[
+                "10.0.0.0/8",
+                "192.0.2.1",
+                "192.0.2.10-192.0.2.20",
+                "*.corp.example",
+                "intranet.example",
+                "-ads.corp.example",
+                "-10.2.3.4",
+            ]
+            .map(String::from),
+        )
+        .unwrap()
+        .unwrap();
+        let listed = "10.1.2.3".parse().unwrap();
+        let excluded = "10.2.3.4".parse().unwrap();
+        let other = "203.0.113.1".parse().unwrap();
+        assert!(bypass.needs_domain(listed));
+        assert!(!bypass.matches_ip(listed));
+        assert!(bypass.matches(listed, None));
+        assert!(!bypass.matches(listed, Some("ads.corp.example")));
+        assert!(!bypass.matches(excluded, Some("www.corp.example")));
+        assert!(bypass.matches("192.0.2.1".parse().unwrap(), None));
+        assert!(bypass.matches("192.0.2.20".parse().unwrap(), None));
+        assert!(bypass.matches(other, Some("WWW.CORP.EXAMPLE.")));
+        assert!(bypass.matches(other, Some("intranet.example")));
+        assert!(!bypass.matches(other, None));
+        assert!(!bypass.matches(other, Some("corp.example")));
+    }
 
     fn hosts(entries: &[&str]) -> HostPatterns {
         let entries = entries

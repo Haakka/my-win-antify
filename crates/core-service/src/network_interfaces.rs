@@ -3,6 +3,8 @@ use std::{ffi::c_void, io, mem::size_of, net::Ipv4Addr, ptr, slice};
 use shared::NetworkInterfaceInfo;
 
 const AF_INET: u16 = 2;
+const AF_UNSPEC: u32 = 0;
+const INCLUDE_ALL_INTERFACES: u32 = 0x0100;
 const SKIP_NON_UNICAST_AND_DNS: u32 = 0x02 | 0x04 | 0x08;
 pub(super) const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 const IF_OPER_STATUS_UP: u32 = 1;
@@ -19,7 +21,7 @@ struct AdapterAddresses {
     first_unicast: *const UnicastAddress,
     _first_anycast: *const c_void,
     _first_multicast: *const c_void,
-    _first_dns_server: *const c_void,
+    first_dns_server: *const DnsServer,
     _dns_suffix: *const u16,
     description: *const u16,
     friendly_name: *const u16,
@@ -29,6 +31,12 @@ struct AdapterAddresses {
     _mtu: u32,
     if_type: u32,
     oper_status: u32,
+}
+
+#[repr(C)]
+struct DnsServer {
+    _alignment: u64,
+    next: *const Self,
 }
 
 #[repr(C)]
@@ -64,23 +72,40 @@ extern "system" {
 }
 
 pub(crate) fn list() -> io::Result<Vec<NetworkInterfaceInfo>> {
+    enumerate(u32::from(AF_INET), SKIP_NON_UNICAST_AND_DNS, read_adapters)
+}
+
+pub(crate) struct DiagnosticAdapter {
+    pub name: String,
+    pub description: String,
+    pub is_up: bool,
+    pub ipv4: Option<Ipv4Addr>,
+    pub dns_servers: usize,
+}
+
+pub(crate) fn diagnostic_adapters() -> io::Result<Vec<DiagnosticAdapter>> {
+    enumerate(
+        AF_UNSPEC,
+        INCLUDE_ALL_INTERFACES | 0x02 | 0x04,
+        read_diagnostic_adapters,
+    )
+}
+
+fn enumerate<T>(
+    family: u32,
+    flags: u32,
+    read: unsafe fn(*const AdapterAddresses) -> Vec<T>,
+) -> io::Result<Vec<T>> {
     let mut size = 15 * 1024;
     for _ in 0..3 {
         // The native linked-list nodes need eight-byte alignment.
         let mut buffer = vec![0u64; (size as usize).div_ceil(size_of::<u64>())];
         let addresses = buffer.as_mut_ptr().cast::<AdapterAddresses>();
-        let status = unsafe {
-            GetAdaptersAddresses(
-                u32::from(AF_INET),
-                SKIP_NON_UNICAST_AND_DNS,
-                ptr::null_mut(),
-                addresses,
-                &mut size,
-            )
-        };
+        let status =
+            unsafe { GetAdaptersAddresses(family, flags, ptr::null_mut(), addresses, &mut size) };
         match status {
             // The API owns the layout of all nodes and pointers until buffer is dropped.
-            0 => return Ok(unsafe { read_adapters(addresses) }),
+            0 => return Ok(unsafe { read(addresses) }),
             ERROR_NO_DATA => return Ok(Vec::new()),
             ERROR_BUFFER_OVERFLOW => continue,
             error => return Err(io::Error::from_raw_os_error(error as i32)),
@@ -108,6 +133,31 @@ unsafe fn read_adapters(mut next: *const AdapterAddresses) -> Vec<NetworkInterfa
         }
     }
     sort_interfaces(&mut interfaces);
+    interfaces
+}
+
+unsafe fn read_diagnostic_adapters(mut next: *const AdapterAddresses) -> Vec<DiagnosticAdapter> {
+    let mut interfaces = Vec::new();
+    while let Some(adapter) = next.as_ref() {
+        next = adapter.next;
+        if adapter.if_type == IF_TYPE_SOFTWARE_LOOPBACK {
+            continue;
+        }
+        let mut dns = adapter.first_dns_server;
+        let mut dns_servers = 0;
+        while let Some(server) = dns.as_ref() {
+            dns = server.next;
+            dns_servers += 1;
+        }
+        interfaces.push(DiagnosticAdapter {
+            name: wide_string(adapter.friendly_name),
+            description: wide_string(adapter.description),
+            is_up: adapter.oper_status == IF_OPER_STATUS_UP,
+            ipv4: first_ipv4(adapter.first_unicast),
+            dns_servers,
+        });
+    }
+    interfaces.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     interfaces
 }
 

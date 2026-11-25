@@ -9,17 +9,26 @@ import {
   CONFIG_SCHEMA_VERSION,
   type ActivityLogEntry,
   type AppConfig,
+  type AutomationConfig,
+  type CoexistenceConflict,
+  type ConfigBackupExport,
   type ConnectionSnapshot,
+  type CurrentWifiInfo,
+  type DiagnosticBundleSummary,
   type GeneralSettings,
   type NavRouteId,
   type NetworkInterfaceInfo,
   type PipeConnectionState,
   type Profile,
   type ProxyConfig,
+  type ProxyHealthSnapshot,
   type ProxyTestResult,
   type Rule,
+  type RulesImportPreview,
   type RunningProcessInfo,
   type ServiceStatus,
+  type TrafficHistoryRange,
+  type TrafficHistoryResponse,
   type TrafficStats,
 } from "@/types";
 
@@ -46,6 +55,10 @@ const DEFAULT_EMPTY_CONFIG: AppConfig = {
     recordConnections: true,
     discoverUnmatched: false,
   },
+  automation: {
+    enabled: false,
+    wifiRules: [],
+  },
 };
 
 const DEFAULT_STATUS: ServiceStatus = {
@@ -53,10 +66,12 @@ const DEFAULT_STATUS: ServiceStatus = {
   startedAtMs: null,
   uptimeSecs: 0,
   servicePid: 0,
-  coreVersion: "0.1.0",
+  coreVersion: "0.2.0",
   driverReady: false,
   activeProfileId: "default",
   lastError: null,
+  configError: null,
+  invalidRuleIds: [],
 };
 
 const DEFAULT_STATS: TrafficStats = {
@@ -72,6 +87,7 @@ const DEFAULT_STATS: TrafficStats = {
   totalDirectUp: 0,
   totalDirectDown: 0,
   ruleLastMatched: [],
+  proxyHealth: [],
 };
 
 export const useAppStore = defineStore("app", () => {
@@ -79,6 +95,12 @@ export const useAppStore = defineStore("app", () => {
   const mockMode = ref<boolean>(!isTauriRuntime());
   const activeRoute = ref<NavRouteId>("dashboard");
   const pipeState = ref<PipeConnectionState>("disconnected");
+  const documentHidden = ref<boolean>(
+    typeof document !== "undefined" ? document.hidden : false,
+  );
+  const discoverRemainingSecs = ref<number | null>(null);
+  const discoverAutoOffNotice = ref(false);
+  let discoverTimer: number | null = null;
 
   const status = ref<ServiceStatus>(structuredClone(DEFAULT_STATUS));
   const stats = ref<TrafficStats>(structuredClone(DEFAULT_STATS));
@@ -88,8 +110,19 @@ export const useAppStore = defineStore("app", () => {
   const runningProcesses = ref<RunningProcessInfo[]>([]);
   const networkInterfaces = ref<NetworkInterfaceInfo[]>([]);
   const proxyTestResults = ref<Record<string, ProxyTestResult>>({});
+  const proxyHealthMap = ref<Record<string, ProxyHealthSnapshot>>({});
   const ruleLastMatchedMap = ref<Record<string, number>>({});
   const speedHistory = ref<{ ts: number; upBps: number; downBps: number }[]>([]);
+  const currentWifi = ref<CurrentWifiInfo>({
+    supported: false,
+    connected: false,
+    ssid: null,
+    interfaceName: null,
+  });
+  const coexistenceConflicts = ref<CoexistenceConflict[]>([]);
+  const trafficHistory = ref<TrafficHistoryResponse | null>(null);
+  const trafficHistoryRange = ref<TrafficHistoryRange>("24h");
+  const trafficHistoryProfileId = ref<string | null>(null);
 
   const busyEngine = ref(false);
   const busySaving = ref(false);
@@ -129,9 +162,17 @@ export const useAppStore = defineStore("app", () => {
     stats.value = tick;
     status.value.running = tick.running;
     status.value.uptimeSecs = tick.uptimeSecs;
+    if (documentHidden.value) {
+      return;
+    }
     for (const item of tick.ruleLastMatched) {
       ruleLastMatchedMap.value[item.ruleId] = item.lastMatchedAtMs;
     }
+    const nextHealth: Record<string, ProxyHealthSnapshot> = {};
+    for (const item of tick.proxyHealth ?? []) {
+      nextHealth[item.proxyId] = item;
+    }
+    proxyHealthMap.value = nextHealth;
     speedHistory.value.push({
       ts: tick.timestampMs,
       upBps: tick.uploadBps,
@@ -140,6 +181,40 @@ export const useAppStore = defineStore("app", () => {
     if (speedHistory.value.length > 60) {
       speedHistory.value.shift();
     }
+  }
+
+  function setDocumentHidden(hidden: boolean) {
+    const wasHidden = documentHidden.value;
+    documentHidden.value = hidden;
+    if (wasHidden && !hidden && isServiceConnected.value) {
+      void hydrateSnapshot();
+    }
+  }
+
+  function syncDiscoverTimer(enabled: boolean) {
+    if (!enabled) {
+      if (discoverTimer !== null) {
+        window.clearInterval(discoverTimer);
+        discoverTimer = null;
+      }
+      discoverRemainingSecs.value = null;
+      return;
+    }
+    if (discoverTimer !== null) {
+      return;
+    }
+    discoverAutoOffNotice.value = false;
+    discoverRemainingSecs.value = 600;
+    discoverTimer = window.setInterval(() => {
+      if (discoverRemainingSecs.value === null) return;
+      if (discoverRemainingSecs.value <= 1) {
+        syncDiscoverTimer(false);
+        discoverAutoOffNotice.value = true;
+        void updateSettings({ discoverUnmatched: false }).catch(() => {});
+      } else {
+        discoverRemainingSecs.value -= 1;
+      }
+    }, 1000);
   }
 
   async function bindAndHydrate() {
@@ -158,7 +233,9 @@ export const useAppStore = defineStore("app", () => {
         applyStatsTick(tick);
       },
       onConnectionEvent(conn) {
-        if (!config.value.settings.recordConnections) return;
+        if (documentHidden.value || !config.value.settings.recordConnections) {
+          return;
+        }
         const idx = connections.value.findIndex((c) => c.id === conn.id);
         if (idx >= 0) {
           connections.value[idx] = conn;
@@ -170,6 +247,7 @@ export const useAppStore = defineStore("app", () => {
         }
       },
       onActivityLog(entry) {
+        if (documentHidden.value) return;
         activityLogs.value.unshift(entry);
         if (activityLogs.value.length > 250) {
           activityLogs.value.pop();
@@ -177,12 +255,24 @@ export const useAppStore = defineStore("app", () => {
       },
       onConfigChanged(nextCfg) {
         config.value = nextCfg;
+        syncDiscoverTimer(nextCfg.settings.discoverUnmatched);
       },
       onPipeState(nextPipe) {
         pipeState.value = nextPipe;
         if (nextPipe === "connected") {
           void hydrateSnapshot();
         }
+      },
+      onProxyTestsStale() {
+        for (const id of Object.keys(proxyTestResults.value)) {
+          const item = proxyTestResults.value[id];
+          if (item) {
+            proxyTestResults.value[id] = { ...item, stale: true };
+          }
+        }
+      },
+      onWifiChanged(wifi) {
+        currentWifi.value = wifi;
       },
     });
 
@@ -196,16 +286,26 @@ export const useAppStore = defineStore("app", () => {
       if (!mockMode.value && currentPipe !== "connected") {
         return;
       }
-      const [st, cfg, conns, logs] = await Promise.all([
+      const [st, cfg, conns, logs, wifi, conflicts] = await Promise.all([
         client.getStatus(),
         client.getConfig(),
         client.getConnections(true, 150),
         client.getActivityLogs(120),
+        client.getCurrentWifi().catch(() => ({
+          supported: false,
+          connected: false,
+          ssid: null,
+          interfaceName: null,
+        })),
+        client.getCoexistenceConflicts().catch(() => []),
       ]);
       status.value = st;
       config.value = cfg;
+      syncDiscoverTimer(cfg.settings.discoverUnmatched);
       connections.value = conns;
       activityLogs.value = logs;
+      currentWifi.value = wifi;
+      coexistenceConflicts.value = conflicts.filter((c) => !c.dismissed);
       errorMessage.value = null;
     } catch (err) {
       errorMessage.value = extractErrorMessage(err);
@@ -258,7 +358,23 @@ export const useAppStore = defineStore("app", () => {
     busySaving.value = true;
     errorMessage.value = null;
     try {
-      config.value = await client.saveConfig(next);
+      const saved = await client.saveConfig(next);
+      config.value = saved;
+      syncDiscoverTimer(saved.settings.discoverUnmatched);
+    } catch (err) {
+      errorMessage.value = extractErrorMessage(err);
+      throw err;
+    } finally {
+      busySaving.value = false;
+    }
+  }
+
+  async function restoreConfigBackup() {
+    busySaving.value = true;
+    errorMessage.value = null;
+    try {
+      config.value = await client.restoreConfigBackup();
+      status.value = await client.getStatus();
     } catch (err) {
       errorMessage.value = extractErrorMessage(err);
       throw err;
@@ -365,6 +481,112 @@ export const useAppStore = defineStore("app", () => {
     await saveConfig(next);
   }
 
+  async function updateAutomation(automation: AutomationConfig) {
+    const next = JSON.parse(JSON.stringify(config.value)) as AppConfig;
+    next.automation = automation;
+    await saveConfig(next);
+  }
+
+  async function exportConfigBackup(
+    includePasswords: boolean,
+  ): Promise<ConfigBackupExport> {
+    return client.exportConfigBackup(includePasswords);
+  }
+
+  async function importConfigBackup(json: string): Promise<AppConfig> {
+    busySaving.value = true;
+    errorMessage.value = null;
+    try {
+      const saved = await client.importConfigBackup(json);
+      config.value = saved;
+      status.value = await client.getStatus();
+      return saved;
+    } catch (err) {
+      errorMessage.value = extractErrorMessage(err);
+      throw err;
+    } finally {
+      busySaving.value = false;
+    }
+  }
+
+  async function exportRulesJson(profileId: string | null): Promise<string> {
+    return client.exportRulesJson(profileId);
+  }
+
+  async function importRulesJson(
+    json: string,
+    profileId: string,
+    dryRun: boolean,
+  ): Promise<RulesImportPreview> {
+    const res = await client.importRulesJson(json, profileId, dryRun);
+    if (!dryRun) {
+      config.value = await client.getConfig();
+    }
+    return res;
+  }
+
+  async function refreshTrafficHistory(
+    range: TrafficHistoryRange = trafficHistoryRange.value,
+    profileId: string | null = trafficHistoryProfileId.value,
+  ) {
+    trafficHistoryRange.value = range;
+    trafficHistoryProfileId.value = profileId;
+    if (!isServiceConnected.value) return;
+    try {
+      trafficHistory.value = await client.getTrafficHistory({
+        range,
+        profileId,
+      });
+    } catch (err) {
+      errorMessage.value = extractErrorMessage(err);
+    }
+  }
+
+  async function clearTrafficHistory() {
+    try {
+      await client.clearTrafficHistory();
+      await refreshTrafficHistory();
+    } catch (err) {
+      errorMessage.value = extractErrorMessage(err);
+    }
+  }
+
+  async function refreshCurrentWifi() {
+    if (!isServiceConnected.value) return;
+    try {
+      currentWifi.value = await client.getCurrentWifi();
+    } catch {
+      // Keep previous Wi-Fi info on transient errors.
+    }
+  }
+
+  async function refreshCoexistenceConflicts() {
+    if (!isServiceConnected.value) return;
+    try {
+      const conflicts = await client.getCoexistenceConflicts();
+      coexistenceConflicts.value = conflicts.filter((c) => !c.dismissed);
+    } catch {
+      // Ignore transient errors.
+    }
+  }
+
+  async function dismissCoexistenceConflict(conflictId: string) {
+    try {
+      await client.dismissCoexistenceConflict(conflictId);
+      coexistenceConflicts.value = coexistenceConflicts.value.filter(
+        (c) => c.id !== conflictId,
+      );
+    } catch (err) {
+      errorMessage.value = extractErrorMessage(err);
+    }
+  }
+
+  async function collectDiagnosticBundle(
+    outputPath: string | null = null,
+  ): Promise<DiagnosticBundleSummary> {
+    return client.collectDiagnosticBundle(outputPath);
+  }
+
   async function testProxy(proxyId: string) {
     testingProxyIds.value[proxyId] = true;
     try {
@@ -377,6 +599,7 @@ export const useAppStore = defineStore("app", () => {
         latencyMs: null,
         error: extractErrorMessage(err),
         checkedAtMs: Date.now(),
+        stale: false,
       };
     } finally {
       testingProxyIds.value[proxyId] = false;
@@ -449,6 +672,9 @@ export const useAppStore = defineStore("app", () => {
     mockMode,
     activeRoute,
     pipeState,
+    documentHidden,
+    discoverRemainingSecs,
+    discoverAutoOffNotice,
     isServiceConnected,
     status,
     stats,
@@ -460,8 +686,14 @@ export const useAppStore = defineStore("app", () => {
     runningProcesses,
     networkInterfaces,
     proxyTestResults,
+    proxyHealthMap,
     ruleLastMatchedMap,
     speedHistory,
+    currentWifi,
+    coexistenceConflicts,
+    trafficHistory,
+    trafficHistoryRange,
+    trafficHistoryProfileId,
     busyEngine,
     busySaving,
     testingProxyIds,
@@ -472,10 +704,12 @@ export const useAppStore = defineStore("app", () => {
     quickAddProfileOpen,
     init,
     hydrateSnapshot,
+    setDocumentHidden,
     setMockMode,
     reconnectService,
     toggleEngine,
     saveConfig,
+    restoreConfigBackup,
     upsertProxy,
     deleteProxy,
     upsertRule,
@@ -486,6 +720,17 @@ export const useAppStore = defineStore("app", () => {
     deleteProfile,
     setActiveProfile,
     updateSettings,
+    updateAutomation,
+    exportConfigBackup,
+    importConfigBackup,
+    exportRulesJson,
+    importRulesJson,
+    refreshTrafficHistory,
+    clearTrafficHistory,
+    refreshCurrentWifi,
+    refreshCoexistenceConflicts,
+    dismissCoexistenceConflict,
+    collectDiagnosticBundle,
     testProxy,
     testAllProxies,
     refreshProcesses,

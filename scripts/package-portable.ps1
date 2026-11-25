@@ -2,6 +2,7 @@
 
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+[System.Environment]::CurrentDirectory = $Root
 
 # Keep rustc's self-contained MinGW linker cleanly ahead without w64devkit\bin shadowing -lgcc_eh.
 $pathPrefix = @("$env:USERPROFILE\.cargo\bin")
@@ -15,6 +16,18 @@ $filteredPath = $env:PATH -split ';' | Where-Object {
     ($_ -ne "$env:USERPROFILE\.local\mingw-tools")
 }
 $env:PATH = (($pathPrefix + $filteredPath) -join ';')
+
+# Provide MinGW gcc/ar for ring's C assembly build without putting w64devkit\bin on PATH (which shadows -lgcc_eh).
+$W64DevkitBin = "$env:USERPROFILE\.local\w64devkit\bin"
+if ((Test-Path (Join-Path $W64DevkitBin "gcc.exe")) -and -not $env:CC_x86_64_pc_windows_gnu) {
+    $env:CC_x86_64_pc_windows_gnu = Join-Path $W64DevkitBin "gcc.exe"
+}
+if ((Test-Path (Join-Path $W64DevkitBin "ar.exe")) -and -not $env:AR_x86_64_pc_windows_gnu) {
+    $env:AR_x86_64_pc_windows_gnu = Join-Path $W64DevkitBin "ar.exe"
+}
+
+$PkgJson = Get-Content -LiteralPath (Join-Path $Root "package.json") -Raw -Encoding utf8 | ConvertFrom-Json
+$AppVersion = $PkgJson.version
 
 Write-Host "[1/4] Typechecking frontend..." -ForegroundColor Cyan
 npm run typecheck
@@ -30,11 +43,14 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build --release -p core-service failed" 
 
 $StageRoot = Join-Path $Root "release"
 $AppDir = Join-Path $StageRoot "MyWinAntify"
-$ZipPath = Join-Path $StageRoot "MyWinAntify-v0.1.0-win-x64.zip"
+$ZipPath = Join-Path $StageRoot "MyWinAntify-v$AppVersion-win-x64.zip"
 
-if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
-if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
-New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+if (Test-Path -LiteralPath $AppDir) {
+    Get-ChildItem -LiteralPath $AppDir -Force | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+}
+if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
 
 $DesktopExe = Join-Path $Root "target\release\my-win-antify.exe"
 $CoreExe = Join-Path $Root "target\release\core-service.exe"
@@ -58,8 +74,8 @@ Copy-Item $CoreExe (Join-Path $AppDir "core-service.exe") -Force
 Copy-Item $WinDivertDll (Join-Path $AppDir "WinDivert.dll") -Force
 Copy-Item $WinDivertSys (Join-Path $AppDir "WinDivert64.sys") -Force
 
-$Readme = @'
-MyWinAntify v0.1.0 (Windows x64 便携绿色版)
+$Readme = @"
+MyWinAntify v$AppVersion (Windows x64 便携绿色版)
 =========================================
 
 项目声明：
@@ -89,7 +105,7 @@ MyWinAntify v0.1.0 (Windows x64 便携绿色版)
 - Windows 10 / Windows 11 (x64)
 - 需要系统内置 Microsoft Edge WebView2 运行时（Win11 默认自带）。
 - 若 Windows Defender 误报拦截 WinDivert64.sys，请将解压后的文件夹加入排除项。
-'@
+"@
 [System.IO.File]::WriteAllText((Join-Path $AppDir "使用说明.txt"), $Readme, [System.Text.UTF8Encoding]::new($true))
 
 Write-Host "[4/4] Creating shareable ZIP archive..." -ForegroundColor Cyan

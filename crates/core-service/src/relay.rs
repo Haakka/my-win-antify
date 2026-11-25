@@ -3,23 +3,34 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use shared::{LogCategory, LogLevel, RuleAction};
+use shared::{LogCategory, LogLevel, ProxyConfig, RuleAction};
 use tokio::{
     io::{self as aio, AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::{oneshot, watch, Notify},
     task::JoinSet,
 };
 
-use crate::{packet::FlowKey, process::Decision, sniffer, socks5, telemetry::Telemetry};
+use crate::{
+    packet::FlowKey,
+    process::Decision,
+    sniffer,
+    targets::BypassHosts,
+    telemetry::Telemetry,
+    upstream::{self, UpstreamError, UpstreamStream, CONNECT_TIMEOUT},
+};
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_LINGER: Duration = Duration::from_secs(15);
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct NatKey {
@@ -50,13 +61,14 @@ pub(crate) struct Mapping {
     pub flow: FlowKey,
     pub id: u64,
     pub decision: Decision,
+    pub bypass_hosts: Option<Arc<BypassHosts>>,
     pub interface: [u32; 2],
 }
 
 struct NatEntry {
     mapping: Mapping,
     expires: Option<Instant>,
-    claimed: bool,
+    claimed: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -67,10 +79,12 @@ impl NatTable {
         let entry = NatEntry {
             mapping,
             expires: Some(Instant::now() + ACCEPT_TIMEOUT),
-            claimed: false,
+            claimed: None,
         };
         match self.0.lock().unwrap().entry(key) {
-            Entry::Occupied(mut slot) if slot.get().claimed && slot.get().expires.is_some() => {
+            Entry::Occupied(mut slot)
+                if slot.get().claimed.is_some() && slot.get().expires.is_some() =>
+            {
                 slot.insert(entry);
                 true
             }
@@ -90,15 +104,16 @@ impl NatTable {
             .map(|entry| entry.mapping.clone())
     }
 
-    fn claim(&self, key: NatKey) -> Option<Mapping> {
+    fn claim(&self, key: NatKey) -> Option<(Mapping, oneshot::Receiver<()>)> {
         let mut mappings = self.0.lock().unwrap();
         let entry = mappings.get_mut(&key)?;
-        if entry.claimed || entry.expires.is_some_and(|expiry| expiry <= Instant::now()) {
+        if entry.claimed.is_some() || entry.expires.is_some_and(|expiry| expiry <= Instant::now()) {
             return None;
         }
-        entry.claimed = true;
+        let (retire, retired) = oneshot::channel();
+        entry.claimed = Some(retire);
         entry.expires = None;
-        Some(entry.mapping.clone())
+        Some((entry.mapping.clone(), retired))
     }
 
     fn close(&self, key: NatKey, id: u64) {
@@ -116,7 +131,7 @@ impl NatTable {
         let mut mappings = self.0.lock().unwrap();
         if mappings
             .get(&key)
-            .is_some_and(|entry| entry.mapping.id == id && !entry.claimed)
+            .is_some_and(|entry| entry.mapping.id == id && entry.claimed.is_none())
         {
             mappings.remove(&key);
             true
@@ -125,13 +140,22 @@ impl NatTable {
         }
     }
 
+    pub fn clear(&self) -> Vec<u64> {
+        self.0
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, entry)| entry.mapping.id)
+            .collect()
+    }
+
     // Return only unaccepted handshakes. Connected streams finish their own telemetry.
     pub fn expire(&self) -> Vec<Mapping> {
         let now = Instant::now();
         let mut expired = Vec::new();
         self.0.lock().unwrap().retain(|_, entry| {
             let keep = entry.expires.is_none_or(|deadline| deadline > now);
-            if !keep && !entry.claimed {
+            if !keep && entry.claimed.is_none() {
                 expired.push(entry.mapping.clone());
             }
             keep
@@ -144,21 +168,30 @@ pub(crate) async fn run(
     listener: TcpListener,
     nat: Arc<NatTable>,
     telemetry: Arc<Telemetry>,
+    mut cancel: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut streams = JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut cancel) => return Ok(()),
             accepted = listener.accept() => {
                 let (client, peer) = accepted?;
                 let _ = client.set_nodelay(true);
                 let (SocketAddr::V4(local), SocketAddr::V4(peer)) = (client.local_addr()?, peer) else { continue };
                 let key = NatKey::new(SocketAddrV4::new(*local.ip(), peer.port()), *peer.ip());
-                let Some(mapping) = nat.claim(key) else { continue };
+                let Some((mapping, retired)) = nat.claim(key) else { continue };
                 let nat = Arc::clone(&nat);
                 let telemetry = Arc::clone(&telemetry);
+                let mut cancel = cancel.clone();
                 streams.spawn(async move {
-                    transfer(client, &mapping, &telemetry).await;
-                    nat.close(key, mapping.id);
+                    tokio::select! {
+                        biased;
+                        _ = retired => telemetry.finish(mapping.id, None),
+                        () = transfer(client, &mapping, &telemetry, &mut cancel) => {
+                            nat.close(key, mapping.id);
+                        }
+                    }
                 });
             }
             Some(result) = streams.join_next(), if !streams.is_empty() => {
@@ -170,35 +203,97 @@ pub(crate) async fn run(
     }
 }
 
-async fn transfer(client: TcpStream, mapping: &Mapping, telemetry: &Telemetry) {
-    let domain = sniffer::peek_domain(&client).await;
+async fn wait_for_shutdown(cancel: &mut watch::Receiver<bool>) {
+    let _ = cancel.wait_for(|stopping| *stopping).await;
+}
+
+async fn transfer(
+    client: TcpStream,
+    mapping: &Mapping,
+    telemetry: &Telemetry,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let id = mapping.id;
+    let domain = tokio::select! {
+        biased;
+        () = wait_for_shutdown(cancel) => {
+            telemetry.finish(id, None);
+            return;
+        }
+        domain = async {
+            if matches!(mapping.flow.remote.port(), 21 | 22 | 25 | 110 | 143 | 587 | 3306)
+                && mapping.decision.pending_hosts.is_none() && mapping.bypass_hosts.is_none()
+            {
+                None
+            } else {
+                sniffer::peek_domain(&client).await
+            }
+        } => domain,
+    };
     if let Some(domain) = &domain {
-        telemetry.domain(mapping.id, domain.clone());
+        telemetry.domain(id, domain.clone());
     }
     let mut action = mapping.decision.action;
-    if let Some(hosts) = &mapping.decision.pending_hosts {
-        let matched = hosts.matches(*mapping.flow.remote.ip(), domain.as_deref());
+    let remote_ip = *mapping.flow.remote.ip();
+    if action == RuleAction::Proxy
+        && mapping
+            .bypass_hosts
+            .as_ref()
+            .is_some_and(|hosts| hosts.matches(remote_ip, domain.as_deref()))
+    {
+        action = RuleAction::Direct;
+        let rule_matched = mapping
+            .decision
+            .pending_hosts
+            .as_ref()
+            .is_none_or(|hosts| hosts.matches(remote_ip, domain.as_deref()));
+        telemetry.resolve_route(id, action, rule_matched);
+        telemetry.route_detail(id, Some("Bypassed via bypassHosts"), None);
+    } else if let Some(hosts) = &mapping.decision.pending_hosts {
+        let matched = hosts.matches(remote_ip, domain.as_deref());
         if !matched {
             action = RuleAction::Direct;
         }
-        telemetry.resolve_route(mapping.id, action, matched);
+        telemetry.resolve_route(id, action, matched);
+        let reason = if matched {
+            mapping.decision.match_reason()
+        } else {
+            "Destination did not match rule".into()
+        };
+        telemetry.route_detail(id, Some(&reason), None);
     }
     if action == RuleAction::Block {
-        telemetry.finish(mapping.id, Some("Blocked by routing policy".into()));
+        telemetry.route_detail(id, None, Some("blocked"));
+        telemetry.finish(id, Some("Blocked by routing policy".into()));
         return;
     }
 
-    let fail = |title, error: io::Error| {
+    let fail = |title, error: &UpstreamError| {
         telemetry.log(
             LogLevel::Warn,
             LogCategory::Proxy,
             title,
             Some(format!("{}: {error}", mapping.flow.remote)),
         );
-        telemetry.finish(mapping.id, Some(error.to_string()));
+        telemetry.route_detail(id, None, Some(error.code));
+        telemetry.finish(id, Some(error.to_string()));
     };
-    let upstream = match connect_upstream(mapping, telemetry, action, domain.as_deref()).await {
+    let generation = telemetry.health_generation();
+    let (stream, used_proxy) = match connect_upstream(
+        mapping,
+        telemetry,
+        action,
+        domain.as_deref(),
+        generation,
+        cancel,
+    )
+    .await
+    {
         Ok(upstream) => upstream,
+        Err(error) if error.io.kind() == io::ErrorKind::Interrupted => {
+            telemetry.finish(id, None);
+            return;
+        }
         Err(error) => {
             let title = match action {
                 RuleAction::Proxy if mapping.decision.network_lock => {
@@ -207,27 +302,78 @@ async fn transfer(client: TcpStream, mapping: &Mapping, telemetry: &Telemetry) {
                 RuleAction::Proxy => "Proxy connection failed",
                 _ => "Direct relay connection failed",
             };
-            fail(title, error);
+            fail(title, &error);
             return;
         }
     };
-    telemetry.activate(mapping.id);
+
+    telemetry.activate(id);
+    let proxy = mapping.decision.proxy.as_ref().filter(|_| used_proxy);
+    let progress = TransferProgress::default();
     let mut client = Counted {
         stream: client,
         telemetry,
-        id: mapping.id,
+        id,
+        progress: &progress,
+        health: None,
         is_upstream: false,
     };
     let mut upstream = Counted {
-        stream: upstream,
+        stream,
         telemetry,
-        id: mapping.id,
+        id,
+        progress: &progress,
+        health: proxy.map(|proxy| (proxy, generation)),
         is_upstream: true,
     };
-    match aio::copy_bidirectional(&mut client, &mut upstream).await {
-        Err(error) if !is_graceful_teardown(&error) => fail("Relay I/O failed", error),
-        _ => telemetry.finish(mapping.id, None),
+    // A separate observer starts the deadline only once the first request byte
+    // reaches the upstream. Idle server-first sockets therefore have no deadline.
+    let copied = tokio::select! {
+        biased;
+        () = wait_for_shutdown(cancel) => {
+            telemetry.finish(id, None);
+            return;
+        }
+        copied = aio::copy_bidirectional(&mut client, &mut upstream) => copied,
+        () = progress.wait_for_response(), if proxy.is_some() => {
+            Ok((0, 0))
+        }
+    };
+    let mut blackhole = None;
+    if let Some(proxy) = proxy {
+        if !progress.responded.load(Ordering::Relaxed)
+            && !progress.client_reset.load(Ordering::Relaxed)
+        {
+            if progress.wrote.load(Ordering::Relaxed) {
+                let failure = if progress.upstream_eof.load(Ordering::Relaxed) {
+                    UpstreamError::protocol(
+                        "Proxy tunnel closed without returning any response bytes",
+                    )
+                } else if let Err(error) = &copied {
+                    classify_relay_io(error)
+                } else {
+                    UpstreamError::timeout(
+                        "Proxy tunnel returned no response bytes before the deadline",
+                    )
+                };
+                telemetry.record_proxy_result(proxy, generation, Err(&failure));
+                blackhole = Some(failure);
+            } else if copied.is_ok() {
+                telemetry.record_proxy_result(proxy, generation, Ok(()));
+            }
+        }
     }
+    match (blackhole, copied) {
+        (Some(error), _) => fail("Proxy tunnel failed", &error),
+        (_, Err(error)) if !is_graceful_teardown(&error) => {
+            fail("Relay I/O failed", &error.into());
+        }
+        _ => telemetry.finish(id, None),
+    }
+}
+
+fn classify_relay_io(error: &io::Error) -> UpstreamError {
+    UpstreamError::from(io::Error::new(error.kind(), error.to_string()))
 }
 
 fn is_graceful_teardown(error: &io::Error) -> bool {
@@ -246,66 +392,160 @@ async fn connect_upstream(
     telemetry: &Telemetry,
     action: RuleAction,
     domain: Option<&str>,
-) -> io::Result<TcpStream> {
+    generation: u64,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(UpstreamStream, bool), UpstreamError> {
+    tokio::select! {
+        biased;
+        () = wait_for_shutdown(cancel) => Err(io::Error::new(io::ErrorKind::Interrupted, "Relay shutting down").into()),
+        upstream = dial_upstream(mapping, telemetry, action, domain, generation) => upstream,
+    }
+}
+
+async fn dial_upstream(
+    mapping: &Mapping,
+    telemetry: &Telemetry,
+    action: RuleAction,
+    domain: Option<&str>,
+    generation: u64,
+) -> Result<(UpstreamStream, bool), UpstreamError> {
     let remote = mapping.flow.remote;
     if action == RuleAction::Proxy {
-        let proxy = mapping.decision.proxy.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "no enabled upstream proxy is configured",
-            )
-        })?;
-        match socks5::connect(proxy, remote, domain).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) if !mapping.decision.network_lock && proxy.fallback_direct => {
-                tracing::warn!(destination = %remote, %error, "SOCKS5 connect failed; retrying directly");
+        let proxy =
+            mapping.decision.proxy.as_ref().ok_or_else(|| {
+                UpstreamError::protocol("No enabled upstream proxy is configured")
+            })?;
+        match upstream::connect(proxy, remote, domain).await {
+            Ok(stream) => return Ok((stream, true)),
+            Err(error) => {
+                telemetry.record_proxy_result(proxy, generation, Err(&error));
+                if mapping.decision.network_lock || !proxy.fallback_direct {
+                    return Err(error);
+                }
                 telemetry.log(
                     LogLevel::Warn,
                     LogCategory::Proxy,
-                    "SOCKS5 connect failed; retrying directly",
+                    "Proxy connect failed; retrying directly",
                     Some(format!("{remote}: {error}")),
                 );
-                telemetry.resolve_route(mapping.id, RuleAction::Direct, true);
+                telemetry.resolve_route(
+                    mapping.id,
+                    RuleAction::Direct,
+                    mapping.decision.rule_id.is_some(),
+                );
+                telemetry.route_detail(
+                    mapping.id,
+                    Some("Fallback direct after proxy failure"),
+                    Some(error.code),
+                );
             }
-            Err(error) => return Err(error),
         }
     }
-    tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(remote))
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(remote))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Direct connection timed out"))?
+        .map_err(|_| UpstreamError::timeout("Direct connection timed out"))?
+        .map_err(UpstreamError::destination)?;
+    Ok((UpstreamStream::Tcp(stream), false))
 }
 
-struct Counted<'a> {
-    stream: TcpStream,
+#[derive(Default)]
+struct TransferProgress {
+    wrote: AtomicBool,
+    responded: AtomicBool,
+    upstream_eof: AtomicBool,
+    client_reset: AtomicBool,
+    changed: Notify,
+}
+
+impl TransferProgress {
+    async fn wait_for_response(&self) {
+        while !self.wrote.load(Ordering::Relaxed) {
+            self.changed.notified().await;
+        }
+        let _ = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+            while !self.upstream_eof.load(Ordering::Relaxed)
+                && !self.responded.load(Ordering::Relaxed)
+            {
+                self.changed.notified().await;
+            }
+        })
+        .await;
+        if self.responded.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn mark(&self, flag: &AtomicBool) -> bool {
+        let first = !flag.swap(true, Ordering::Relaxed);
+        if first {
+            self.changed.notify_waiters();
+        }
+        first
+    }
+}
+
+struct Counted<'a, S> {
+    stream: S,
     telemetry: &'a Telemetry,
     id: u64,
+    progress: &'a TransferProgress,
+    health: Option<(&'a ProxyConfig, u64)>,
     is_upstream: bool,
 }
 
-impl AsyncRead for Counted<'_> {
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buffer)
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.stream).poll_read(cx, buffer);
+        match &result {
+            Poll::Ready(Ok(())) if self.is_upstream => {
+                if buffer.filled().len() > before {
+                    if self.progress.mark(&self.progress.responded) {
+                        if let Some((proxy, generation)) = self.health {
+                            self.telemetry
+                                .record_proxy_result(proxy, generation, Ok(()));
+                        }
+                    }
+                } else {
+                    self.progress.mark(&self.progress.upstream_eof);
+                }
+            }
+            Poll::Ready(Err(error)) if !self.is_upstream && is_graceful_teardown(error) => {
+                self.progress.mark(&self.progress.client_reset);
+            }
+            _ => {}
+        }
+        result
     }
 }
 
-impl AsyncWrite for Counted<'_> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.stream).poll_write(cx, bytes);
-        if let Poll::Ready(Ok(count)) = result {
-            let (up, down) = if self.is_upstream {
-                (count, 0)
-            } else {
-                (0, count)
-            };
-            self.telemetry.bytes(self.id, up, down);
+        match &result {
+            Poll::Ready(Ok(count)) => {
+                let (up, down) = if self.is_upstream {
+                    if *count > 0 {
+                        self.progress.mark(&self.progress.wrote);
+                    }
+                    (*count, 0)
+                } else {
+                    (0, *count)
+                };
+                self.telemetry.bytes(self.id, up, down);
+            }
+            Poll::Ready(Err(error)) if !self.is_upstream && is_graceful_teardown(error) => {
+                self.progress.mark(&self.progress.client_reset);
+            }
+            _ => {}
         }
         result
     }
@@ -315,7 +555,12 @@ impl AsyncWrite for Counted<'_> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        let result = Pin::new(&mut self.stream).poll_shutdown(cx);
+        if matches!(&result, Poll::Ready(Err(error)) if !self.is_upstream && is_graceful_teardown(error))
+        {
+            self.progress.mark(&self.progress.client_reset);
+        }
+        result
     }
 }
 
@@ -376,19 +621,28 @@ mod tests {
                 interface_name: None,
                 allow_lan: false,
                 udp_relay: false,
+                skip_tls_verify: false,
                 fallback_direct: false,
                 enabled: true,
             }),
             ..Decision::direct()
         };
-        let telemetry = Telemetry::new();
-        let id = telemetry.open(flow, &crate::process::Process::unknown(1), &decision, true);
+        let telemetry = Telemetry::new(None);
+        let id = telemetry.open(
+            flow,
+            &crate::process::Process::unknown(1),
+            &decision,
+            true,
+            None,
+        );
         let mapping = Mapping {
             flow,
             id,
             decision,
+            bypass_hosts: None,
             interface: [0, 0],
         };
+        let (_shutdown, mut cancel) = watch::channel(false);
 
         let proxy_side = async {
             let (mut socket, _) = proxy.accept().await.unwrap();
@@ -425,7 +679,7 @@ mod tests {
             tokio::join!(
                 proxy_side,
                 client_side,
-                transfer(accepted, &mapping, &telemetry)
+                transfer(accepted, &mapping, &telemetry, &mut cancel)
             )
         })
         .await
@@ -436,6 +690,121 @@ mod tests {
         assert!(snapshot.error.is_none());
         assert_eq!((snapshot.bytes_up, snapshot.bytes_down), (4, 4));
         assert!(telemetry.logs(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_byte_tunnel_penalizes_health_but_client_reset_does_not() {
+        use shared::{AppConfig, IpcEvent, ProxyHealthStatus, ServiceStatus};
+
+        for client_reset in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            let proxy = upstream::mock_proxy(
+                ProxyProtocol::Socks5,
+                proxy_listener.local_addr().unwrap().port(),
+            );
+            let telemetry = Telemetry::new(None);
+            let mut config = AppConfig::default();
+            config.proxies.push(proxy.clone());
+            telemetry.update_config(&config);
+            let decision = Decision {
+                action: RuleAction::Proxy,
+                proxy: Some(proxy),
+                ..Decision::direct()
+            };
+            let flow = FlowKey {
+                local: client.local_addr().unwrap().to_string().parse().unwrap(),
+                remote: "203.0.113.1:443".parse().unwrap(),
+            };
+            let id = telemetry.open(
+                flow,
+                &crate::process::Process::unknown(1),
+                &decision,
+                true,
+                None,
+            );
+            let mapping = Mapping {
+                flow,
+                id,
+                decision,
+                bypass_hosts: None,
+                interface: [0, 0],
+            };
+            let (_shutdown, mut cancel) = watch::channel(false);
+            let (sent, seen) = oneshot::channel();
+            let proxy_side = async {
+                let (mut stream, _) = proxy_listener.accept().await.unwrap();
+                stream.read_exact(&mut [0; 3]).await.unwrap();
+                stream.write_all(&[5, 0]).await.unwrap();
+                stream.read_exact(&mut [0; 10]).await.unwrap();
+                stream
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let mut request = [0; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                sent.send(()).unwrap();
+                if client_reset {
+                    assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+                } else {
+                    stream.shutdown().await.unwrap();
+                }
+            };
+            let client_side = async {
+                let mut client = client;
+                client.write_all(b"ping").await.unwrap();
+                seen.await.unwrap();
+                if client_reset {
+                    client.set_zero_linger().unwrap();
+                    drop(client);
+                } else {
+                    // Keep the client write side open. Upstream EOF must end the relay.
+                    assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+                }
+            };
+            timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    proxy_side,
+                    client_side,
+                    transfer(accepted, &mapping, &telemetry, &mut cancel)
+                )
+            })
+            .await
+            .unwrap();
+            let snapshot = telemetry.connections(true, Some(1)).remove(0);
+            let mut events = telemetry.events.subscribe();
+            telemetry.tick(&ServiceStatus {
+                running: true,
+                started_at_ms: None,
+                uptime_secs: 1,
+                service_pid: 0,
+                core_version: "test".into(),
+                driver_ready: false,
+                active_profile_id: "default".into(),
+                last_error: None,
+                config_error: None,
+                invalid_rule_ids: Vec::new(),
+            });
+            let IpcEvent::StatsTick(stats) = events.try_recv().unwrap() else {
+                panic!("expected stats")
+            };
+            let health = &stats.proxy_health[0];
+            if client_reset {
+                assert_eq!(snapshot.state, ConnectionState::Closed);
+                assert_eq!(snapshot.failure_code, None);
+                assert_eq!(health.status, ProxyHealthStatus::Unknown);
+            } else {
+                assert_eq!(snapshot.state, ConnectionState::Failed);
+                assert_eq!(snapshot.failure_code.as_deref(), Some("protocol_error"));
+                assert_eq!(health.status, ProxyHealthStatus::Unreachable);
+                assert_eq!(health.last_error_code.as_deref(), Some("protocol_error"));
+            }
+        }
     }
 
     #[test]
@@ -450,6 +819,7 @@ mod tests {
             flow,
             id: 1,
             decision: Decision::direct(),
+            bypass_hosts: None,
             interface: [0, 0],
         };
         assert!(!nat.remove_unclaimed(flow, 1));
@@ -459,7 +829,7 @@ mod tests {
         assert!(nat.find(key).is_none());
 
         assert!(nat.insert(key, mapping));
-        assert_eq!(nat.claim(key).unwrap().id, 1);
+        assert_eq!(nat.claim(key).unwrap().0.id, 1);
         assert!(!nat.remove_unclaimed(flow, 1));
         assert_eq!(nat.find(key).unwrap().id, 1);
         nat.close(key, 1);
@@ -482,6 +852,7 @@ mod tests {
             flow,
             id: 1,
             decision: Decision::direct(),
+            bypass_hosts: None,
             interface: [0, 0],
         };
         let replacement = Mapping {
@@ -490,14 +861,55 @@ mod tests {
         };
         assert!(nat.insert(key, original));
         assert!(!nat.insert(key, replacement.clone()));
-        assert_eq!(nat.claim(key).unwrap().id, 1);
+        assert_eq!(nat.claim(key).unwrap().0.id, 1);
         assert!(!nat.insert(key, replacement.clone()));
 
         nat.close(key, 1);
         assert!(nat.insert(key, replacement));
-        assert_eq!(nat.claim(key).unwrap().id, 2);
+        assert_eq!(nat.claim(key).unwrap().0.id, 2);
         nat.close(key, 1);
         assert!(nat.0.lock().unwrap().get(&key).unwrap().expires.is_none());
+    }
+
+    #[test]
+    fn clearing_nat_cancels_claimed_relays_and_removes_lingering_entries() {
+        let nat = NatTable::default();
+        let flow = FlowKey {
+            local: "192.0.2.1:55000".parse().unwrap(),
+            remote: "203.0.113.2:443".parse().unwrap(),
+        };
+        let lingering_flow = FlowKey {
+            local: "192.0.2.1:55001".parse().unwrap(),
+            ..flow
+        };
+        for (flow, id) in [(flow, 1), (lingering_flow, 2)] {
+            assert!(nat.insert(
+                NatKey::from_flow(flow),
+                Mapping {
+                    flow,
+                    id,
+                    decision: Decision::direct(),
+                    bypass_hosts: None,
+                    interface: [0, 0],
+                }
+            ));
+        }
+        let active = NatKey::from_flow(flow);
+        let lingering = NatKey::from_flow(lingering_flow);
+        let (_, mut retired) = nat.claim(active).unwrap();
+        let _ = nat.claim(lingering).unwrap();
+        nat.close(lingering, 2);
+        assert_eq!(retired.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        let mut ids = nat.clear();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(
+            retired.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+        assert!(nat.find(active).is_none());
+        assert!(nat.find(lingering).is_none());
     }
 
     #[test]
@@ -542,19 +954,28 @@ mod tests {
                     interface_name: None,
                     allow_lan: false,
                     udp_relay: false,
+                    skip_tls_verify: false,
                     fallback_direct,
                     enabled: true,
                 }),
                 ..Decision::direct()
             };
-            let telemetry = Telemetry::new();
-            let id = telemetry.open(flow, &crate::process::Process::unknown(1), &decision, true);
+            let telemetry = Telemetry::new(None);
+            let id = telemetry.open(
+                flow,
+                &crate::process::Process::unknown(1),
+                &decision,
+                true,
+                None,
+            );
             let mapping = Mapping {
                 flow,
                 id,
                 decision,
+                bypass_hosts: None,
                 interface: [0, 0],
             };
+            let (_shutdown, mut cancel) = watch::channel(false);
             let reject = async {
                 let (mut socket, _) = proxy.accept().await.unwrap();
                 let mut greeting = [0; 3];
@@ -569,7 +990,14 @@ mod tests {
                     .await
                     .unwrap();
             };
-            let connect = connect_upstream(&mapping, &telemetry, RuleAction::Proxy, None);
+            let connect = connect_upstream(
+                &mapping,
+                &telemetry,
+                RuleAction::Proxy,
+                None,
+                0,
+                &mut cancel,
+            );
             let ((), result) = timeout(Duration::from_secs(2), async {
                 tokio::join!(reject, connect)
             })
@@ -577,8 +1005,11 @@ mod tests {
             .unwrap();
             let snapshot = telemetry.connections(false, Some(1)).remove(0);
             if fallback_direct && !network_lock {
+                let (UpstreamStream::Tcp(stream), false) = result.unwrap() else {
+                    panic!("expected a direct TCP fallback")
+                };
                 assert_eq!(
-                    result.unwrap().peer_addr().unwrap(),
+                    stream.peer_addr().unwrap(),
                     destination.local_addr().unwrap()
                 );
                 assert_eq!(snapshot.action, RuleAction::Direct);
@@ -588,11 +1019,80 @@ mod tests {
                     .iter()
                     .any(|entry| matches!(entry.level, LogLevel::Warn)));
             } else {
-                assert!(result.unwrap_err().to_string().contains("reply 0x05"));
+                assert!(result.err().unwrap().to_string().contains("reply 0x05"));
                 assert_eq!(snapshot.action, RuleAction::Proxy);
                 assert!(telemetry.logs(None).is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_socks5_handshake() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mapping = Mapping {
+            flow: FlowKey {
+                local: "192.0.2.1:55000".parse().unwrap(),
+                remote: "203.0.113.2:443".parse().unwrap(),
+            },
+            id: 1,
+            decision: Decision {
+                action: RuleAction::Proxy,
+                proxy: Some(ProxyConfig {
+                    id: "stalled".into(),
+                    name: "Stalled proxy".into(),
+                    protocol: ProxyProtocol::Socks5,
+                    host: "127.0.0.1".into(),
+                    port: proxy.local_addr().unwrap().port(),
+                    auth: None,
+                    interface_name: None,
+                    allow_lan: false,
+                    udp_relay: false,
+                    skip_tls_verify: false,
+                    fallback_direct: false,
+                    enabled: true,
+                }),
+                ..Decision::direct()
+            },
+            bypass_hosts: None,
+            interface: [0, 0],
+        };
+        let telemetry = Telemetry::new(None);
+        let (shutdown, mut cancel) = watch::channel(false);
+        let proxy_side = async {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            let cancelled_at = Instant::now();
+            shutdown.send(true).unwrap();
+            assert_eq!(
+                timeout(Duration::from_millis(300), socket.read(&mut [0; 1]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            cancelled_at
+        };
+        let connect = async {
+            let result = connect_upstream(
+                &mapping,
+                &telemetry,
+                RuleAction::Proxy,
+                None,
+                0,
+                &mut cancel,
+            )
+            .await;
+            assert_eq!(result.err().unwrap().io.kind(), io::ErrorKind::Interrupted);
+            Instant::now()
+        };
+        let (cancelled_at, finished_at) = timeout(Duration::from_secs(2), async {
+            tokio::join!(proxy_side, connect)
+        })
+        .await
+        .unwrap();
+        assert!(finished_at.duration_since(cancelled_at) < Duration::from_millis(300));
     }
 
     fn domain_filter(remote: SocketAddrV4) -> Option<Arc<crate::targets::HostPatterns>> {
@@ -619,11 +1119,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_dials_original_ip_for_unmatched_and_excluded_domains() {
-        for (host, action) in [
-            ("other.test", RuleAction::Proxy),
-            ("ads.example.org", RuleAction::Proxy),
-            ("ads.example.org", RuleAction::Block),
+    async fn relay_dials_original_ip_for_unmatched_excluded_and_bypassed_domains() {
+        for (host, action, bypass) in [
+            ("other.test", RuleAction::Proxy, false),
+            ("ads.example.org", RuleAction::Proxy, false),
+            ("ads.example.org", RuleAction::Block, false),
+            ("www.example.org", RuleAction::Proxy, true),
         ] {
             let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -647,14 +1148,26 @@ mod tests {
                 rule_id: Some("domains".into()),
                 ..Decision::direct()
             };
-            let telemetry = Telemetry::new();
-            let id = telemetry.open(flow, &crate::process::Process::unknown(1), &decision, true);
+            let telemetry = Telemetry::new(None);
+            let id = telemetry.open(
+                flow,
+                &crate::process::Process::unknown(1),
+                &decision,
+                true,
+                None,
+            );
             let mapping = Mapping {
                 flow,
                 id,
                 decision,
+                bypass_hosts: if bypass {
+                    BypassHosts::parse(&["*.example.org".into()]).unwrap()
+                } else {
+                    None
+                },
                 interface: [0, 0],
             };
+            let (_shutdown, mut cancel) = watch::channel(false);
             let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
             let response = b"HTTP/1.1 204 No Content\r\n\r\n";
             let server = async {
@@ -673,7 +1186,11 @@ mod tests {
                 assert_eq!(bytes, response);
             };
             timeout(Duration::from_secs(2), async {
-                tokio::join!(server, client, transfer(accepted, &mapping, &telemetry))
+                tokio::join!(
+                    server,
+                    client,
+                    transfer(accepted, &mapping, &telemetry, &mut cancel)
+                )
             })
             .await
             .unwrap();
@@ -681,7 +1198,7 @@ mod tests {
             assert_eq!(snapshot.domain.as_deref(), Some(host));
             assert_eq!(snapshot.action, RuleAction::Direct);
             assert_eq!(snapshot.state, ConnectionState::Closed);
-            assert!(snapshot.rule_id.is_none());
+            assert_eq!(snapshot.rule_id.as_deref(), bypass.then_some("domains"));
             assert_eq!(
                 (snapshot.bytes_up, snapshot.bytes_down),
                 (request.len() as u64, response.len() as u64)
@@ -717,13 +1234,20 @@ mod tests {
                 interface_name: None,
                 allow_lan: false,
                 udp_relay: false,
+                skip_tls_verify: false,
                 fallback_direct: true,
                 enabled: true,
             }),
             ..Decision::direct()
         };
-        let telemetry = Telemetry::new();
-        let id = telemetry.open(flow, &crate::process::Process::unknown(1), &decision, true);
+        let telemetry = Telemetry::new(None);
+        let id = telemetry.open(
+            flow,
+            &crate::process::Process::unknown(1),
+            &decision,
+            true,
+            None,
+        );
         let nat = Arc::new(NatTable::default());
         assert!(nat.insert(
             NatKey::from_flow(flow),
@@ -731,10 +1255,12 @@ mod tests {
                 flow,
                 id,
                 decision,
+                bypass_hosts: None,
                 interface: [0, 0]
             }
         ));
-        let relay_task = tokio::spawn(run(relay, Arc::clone(&nat), Arc::clone(&telemetry)));
+        let (shutdown, cancel) = watch::channel(false);
+        let relay_task = tokio::spawn(run(relay, Arc::clone(&nat), Arc::clone(&telemetry), cancel));
         let request = b"GET / HTTP/1.1\r\nHost: WWW.Example.org\r\n\r\n";
         let response = b"HTTP/1.1 204 No Content\r\n\r\n";
         let proxy_side = async {
@@ -793,6 +1319,7 @@ mod tests {
             (snapshot.bytes_up, snapshot.bytes_down),
             (request.len() as u64, response.len() as u64)
         );
-        relay_task.abort();
+        shutdown.send(true).unwrap();
+        relay_task.await.unwrap().unwrap();
     }
 }

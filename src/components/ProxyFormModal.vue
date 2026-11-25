@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
-import { Eye, EyeOff, Globe } from "lucide-vue-next";
+import { AlertTriangle, Eye, EyeOff, Globe } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
+import { useI18n } from "@/i18n";
 import type { ProxyConfig, ProxyProtocol } from "@/types";
 import { randomId } from "@/utils/format";
 import HelpTooltip from "./HelpTooltip.vue";
@@ -19,6 +20,7 @@ const emit = defineEmits<{
 }>();
 
 const store = useAppStore();
+const { t } = useI18n();
 
 const form = reactive({
   name: "",
@@ -30,44 +32,94 @@ const form = reactive({
   udpRelay: true,
   fallbackDirect: false,
   allowLan: false,
+  skipTlsVerify: false,
   interfaceName: "",
 });
 
 const showPassword = ref(false);
 const validationError = ref<string | null>(null);
 
-const protocolOptions: SelectOption[] = [
-  { value: "socks5", label: "SOCKS5", description: "通用 SOCKS5 代理协议" },
-  { value: "http", label: "HTTP (M2)", description: "将在 Milestone 2 支持", disabled: true },
-];
+const isDirectInterface = computed(() => form.protocol === "directInterface");
+const isHttps = computed(() => form.protocol === "https");
+const isSocks5 = computed(() => form.protocol === "socks5");
+
+const protocolOptions = computed<SelectOption[]>(() => [
+  { value: "socks5", label: "SOCKS5", description: "TCP + UDP ASSOCIATE" },
+  { value: "http", label: "HTTP", description: "HTTP CONNECT" },
+  { value: "https", label: "HTTPS", description: "TLS + HTTP CONNECT" },
+  {
+    value: "directInterface",
+    label: t("proxies.directInterfaceLabel"),
+    description: t("proxyModal.interfaceDirectHelp"),
+  },
+]);
 
 const interfaceOptions = computed<SelectOption[]>(() => {
-  const options: SelectOption[] = [
-    { value: "", label: "自动", description: "由 Windows 系统路由表自动选择" },
-  ];
+  const options: SelectOption[] = isDirectInterface.value
+    ? []
+    : [{ value: "", label: t("common.auto") }];
   const seen = new Set<string>();
   for (const iface of store.networkInterfaces) {
     seen.add(iface.name);
     options.push({
       value: iface.name,
       label: iface.name,
-      description: `${iface.ipv4}${iface.isUp ? "" : " (未连接)"} · ${iface.description}`,
+      description: `${iface.ipv4}${iface.isUp ? "" : " (offline)"} · ${iface.description}`,
     });
   }
   if (form.interfaceName && !seen.has(form.interfaceName)) {
     options.push({
       value: form.interfaceName,
       label: form.interfaceName,
-      description: "当前不在线",
     });
   }
   return options;
 });
 
+const duplicateWarnings = computed(() => {
+  const warnings: string[] = [];
+  const nameLower = form.name.trim().toLowerCase();
+  const hostLower = form.host.trim().toLowerCase();
+  const portNum = Number(form.port);
+  const others = store.config.proxies.filter((p) => p.id !== props.editing?.id);
+
+  if (nameLower && others.some((p) => p.name.trim().toLowerCase() === nameLower)) {
+    warnings.push(t("proxyModal.dupNameWarn"));
+  }
+  if (isDirectInterface.value) {
+    if (
+      form.interfaceName &&
+      others.some(
+        (p) =>
+          p.protocol === "directInterface" &&
+          p.interfaceName === form.interfaceName,
+      )
+    ) {
+      warnings.push(t("proxyModal.dupEndpointWarn"));
+    }
+  } else if (
+    hostLower &&
+    Number.isInteger(portNum) &&
+    portNum > 0 &&
+    others.some(
+      (p) =>
+        p.protocol !== "directInterface" &&
+        p.host.trim().toLowerCase() === hostLower &&
+        p.port === portNum,
+    )
+  ) {
+    warnings.push(t("proxyModal.dupEndpointWarn"));
+  }
+  return warnings;
+});
+
 const canSubmit = computed(() => {
+  if (!form.name.trim()) return false;
+  if (isDirectInterface.value) {
+    return form.interfaceName.trim().length > 0;
+  }
   const portNum = Number(form.port);
   return (
-    form.name.trim().length > 0 &&
     form.host.trim().length > 0 &&
     Number.isInteger(portNum) &&
     portNum >= 1 &&
@@ -86,12 +138,13 @@ watch(
       form.name = item.name;
       form.protocol = item.protocol;
       form.host = item.host;
-      form.port = String(item.port);
+      form.port = item.port ? String(item.port) : "";
       form.username = item.auth?.username ?? "";
       form.password = item.auth?.password ?? "";
       form.udpRelay = item.udpRelay;
       form.fallbackDirect = item.fallbackDirect;
       form.allowLan = item.allowLan;
+      form.skipTlsVerify = item.skipTlsVerify ?? false;
       form.interfaceName = item.interfaceName ?? "";
     } else {
       form.name = "";
@@ -103,10 +156,20 @@ watch(
       form.udpRelay = true;
       form.fallbackDirect = false;
       form.allowLan = false;
+      form.skipTlsVerify = false;
       form.interfaceName = "";
     }
   },
   { immediate: true },
+);
+
+watch(
+  () => form.protocol,
+  (proto) => {
+    if (proto === "directInterface" && !form.interfaceName) {
+      form.interfaceName = store.networkInterfaces[0]?.name ?? "";
+    }
+  },
 );
 
 function onKeyDown(ev: KeyboardEvent) {
@@ -122,26 +185,33 @@ onBeforeUnmount(() => {
 
 function submit() {
   const name = form.name.trim();
-  const host = form.host.trim();
-  const port = Number(form.port);
+  const host = isDirectInterface.value ? "" : form.host.trim();
+  const port = isDirectInterface.value ? 0 : Number(form.port);
 
   if (!name) {
-    validationError.value = "请输入代理名称";
+    validationError.value = t("proxyModal.errName");
     return;
   }
-  if (!host) {
-    validationError.value = "请输入服务器地址";
-    return;
-  }
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    validationError.value = "端口范围需在 1 ~ 65535";
-    return;
+  if (isDirectInterface.value) {
+    if (!form.interfaceName.trim()) {
+      validationError.value = t("proxyModal.errNic");
+      return;
+    }
+  } else {
+    if (!host) {
+      validationError.value = t("proxyModal.errHost");
+      return;
+    }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      validationError.value = t("proxyModal.errPort");
+      return;
+    }
   }
 
-  const username = form.username.trim();
-  const password = form.password;
+  const username = isDirectInterface.value ? "" : form.username.trim();
+  const password = isDirectInterface.value ? "" : form.password;
   if ((username.length > 0) !== (password.length > 0)) {
-    validationError.value = "填写认证信息时，用户名与密码需同时填写";
+    validationError.value = t("proxyModal.errAuth");
     return;
   }
 
@@ -153,9 +223,10 @@ function submit() {
     port,
     auth: username.length > 0 ? { username, password } : null,
     interfaceName: form.interfaceName.trim() || null,
-    allowLan: form.allowLan,
-    udpRelay: form.udpRelay,
-    fallbackDirect: form.fallbackDirect,
+    allowLan: isDirectInterface.value ? false : form.allowLan,
+    udpRelay: isSocks5.value ? form.udpRelay : false,
+    fallbackDirect: isDirectInterface.value ? false : form.fallbackDirect,
+    skipTlsVerify: isHttps.value ? form.skipTlsVerify : false,
     enabled: props.editing?.enabled ?? true,
   });
 }
@@ -171,14 +242,12 @@ function submit() {
       <div
         class="flex max-h-[88vh] w-full max-w-[440px] flex-col overflow-hidden rounded-[18px] border border-gray-200/90 bg-white shadow-2xl"
       >
-        <!-- Header -->
         <div class="border-b border-gray-200/75 px-5 py-3.5">
           <h3 class="text-[15px] font-semibold text-gray-900">
-            {{ editing ? "编辑代理" : "添加代理" }}
+            {{ editing ? t("proxyModal.editTitle") : t("proxyModal.addTitle") }}
           </h3>
         </div>
 
-        <!-- Body -->
         <div class="space-y-3.5 overflow-y-auto px-5 py-4">
           <div
             v-if="validationError"
@@ -187,24 +256,32 @@ function submit() {
             {{ validationError }}
           </div>
 
-          <!-- Group 1: 名称 / 类型 -->
+          <div
+            v-for="warn in duplicateWarnings"
+            :key="warn"
+            class="flex items-center gap-2 rounded-xl bg-amber-50 px-3.5 py-2 text-[12px] text-amber-800"
+          >
+            <AlertTriangle class="h-3.5 w-3.5 shrink-0" />
+            <span>{{ warn }}</span>
+          </div>
+
           <div class="divide-y divide-gray-200/75 rounded-2xl bg-[#F5F5F7] px-4">
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <label class="shrink-0 text-[13px] font-medium text-gray-800">
-                名称
+                {{ t("proxyModal.name") }}
               </label>
               <input
                 v-model="form.name"
                 type="text"
                 autofocus
-                placeholder="例如：FlClash"
+                :placeholder="t('proxyModal.namePlaceholder')"
                 class="h-8 w-[220px] rounded-lg border border-gray-200/90 bg-white px-3 text-[13px] text-gray-900 outline-none transition focus:border-[#0A7AFF] focus:ring-[3px] focus:ring-[#0A7AFF]/25"
               />
             </div>
 
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <label class="shrink-0 text-[13px] font-medium text-gray-800">
-                类型
+                {{ t("proxyModal.type") }}
               </label>
               <SelectMenu
                 :model-value="form.protocol"
@@ -219,11 +296,13 @@ function submit() {
             </div>
           </div>
 
-          <!-- Group 2: 服务器地址 / 端口 -->
-          <div class="divide-y divide-gray-200/75 rounded-2xl bg-[#F5F5F7] px-4">
+          <div
+            v-if="!isDirectInterface"
+            class="divide-y divide-gray-200/75 rounded-2xl bg-[#F5F5F7] px-4"
+          >
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <label class="shrink-0 text-[13px] font-medium text-gray-800">
-                服务器地址
+                {{ t("proxyModal.host") }}
               </label>
               <input
                 v-model="form.host"
@@ -235,7 +314,7 @@ function submit() {
 
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <label class="shrink-0 text-[13px] font-medium text-gray-800">
-                端口
+                {{ t("proxyModal.port") }}
               </label>
               <input
                 v-model="form.port"
@@ -248,11 +327,13 @@ function submit() {
             </div>
           </div>
 
-          <!-- Group 3: 用户名 / 密码（可选） -->
-          <div class="divide-y divide-gray-200/75 rounded-2xl bg-[#F5F5F7] px-4">
+          <div
+            v-if="!isDirectInterface"
+            class="divide-y divide-gray-200/75 rounded-2xl bg-[#F5F5F7] px-4"
+          >
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <label class="shrink-0 text-[13px] font-medium text-gray-800">
-                用户名（可选）
+                {{ t("proxyModal.username") }}
               </label>
               <input
                 v-model="form.username"
@@ -264,7 +345,7 @@ function submit() {
 
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <label class="shrink-0 text-[13px] font-medium text-gray-800">
-                密码（可选）
+                {{ t("proxyModal.password") }}
               </label>
               <div class="flex items-center gap-2">
                 <input
@@ -275,7 +356,7 @@ function submit() {
                 />
                 <button
                   type="button"
-                  :title="showPassword ? '隐藏密码' : '显示密码'"
+                  :title="showPassword ? t('proxyModal.hidePassword') : t('proxyModal.showPassword')"
                   class="flex h-7 w-7 items-center justify-center rounded-md text-gray-500 transition hover:bg-gray-200/70 hover:text-gray-800"
                   @click="showPassword = !showPassword"
                 >
@@ -286,59 +367,82 @@ function submit() {
             </div>
           </div>
 
-          <!-- Group 4: 高级策略开关 -->
           <div class="divide-y divide-gray-200/75 rounded-2xl bg-[#F5F5F7] px-4">
-            <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
+            <div
+              v-if="isHttps"
+              class="flex min-h-[44px] items-center justify-between gap-4 py-2"
+            >
               <div class="flex items-center gap-1.5">
-                <span class="text-[13px] font-medium text-gray-800">UDP 转发</span>
-                <HelpTooltip
-                  text="允许通过 SOCKS5 UDP ASSOCIATE 转发该代理的 UDP 流量（如 DNS、游戏、QUIC；当前 M1 为 TCP 优先，UDP 转发将在 M2 生效）。"
-                />
+                <span class="text-[13px] font-medium text-gray-800">
+                  {{ t("proxyModal.skipTlsVerify") }}
+                </span>
+                <HelpTooltip :text="t('proxyModal.skipTlsVerifyHelp')" />
+              </div>
+              <ToggleSwitch v-model="form.skipTlsVerify" size="sm" />
+            </div>
+
+            <div
+              v-if="isSocks5"
+              class="flex min-h-[44px] items-center justify-between gap-4 py-2"
+            >
+              <div class="flex items-center gap-1.5">
+                <span class="text-[13px] font-medium text-gray-800">
+                  {{ t("proxyModal.udpRelay") }}
+                </span>
+                <HelpTooltip :text="t('proxyModal.udpRelayHelp')" />
               </div>
               <ToggleSwitch v-model="form.udpRelay" size="sm" />
             </div>
 
-            <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
+            <div
+              v-if="!isDirectInterface"
+              class="flex min-h-[44px] items-center justify-between gap-4 py-2"
+            >
               <div class="flex items-center gap-1.5">
                 <span class="text-[13px] font-medium text-gray-800">
-                  代理失败时直连
+                  {{ t("proxyModal.fallbackDirect") }}
                 </span>
-                <HelpTooltip
-                  text="当上游代理连接超时或被拒绝时，自动回退为直连目标服务器；若对应规则开启了「网络锁」，则优先生效网络锁并拒绝回退。"
-                />
+                <HelpTooltip :text="t('proxyModal.fallbackDirectHelp')" />
               </div>
               <ToggleSwitch v-model="form.fallbackDirect" size="sm" />
             </div>
 
-            <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
+            <div
+              v-if="!isDirectInterface"
+              class="flex min-h-[44px] items-center justify-between gap-4 py-2"
+            >
               <div class="flex items-center gap-1.5">
                 <span class="text-[13px] font-medium text-gray-800">
-                  可访问私有网络
+                  {{ t("proxyModal.allowLan") }}
                 </span>
-                <HelpTooltip
-                  text="允许经由该代理转发发往内网 / 局域网私有 IP 段（如 10.0.0.0/8、192.168.0.0/16）的流量。"
-                />
+                <HelpTooltip :text="t('proxyModal.allowLanHelp')" />
               </div>
               <ToggleSwitch v-model="form.allowLan" size="sm" />
             </div>
 
             <div class="flex min-h-[44px] items-center justify-between gap-4 py-2">
               <div class="flex items-center gap-1.5">
-                <span class="text-[13px] font-medium text-gray-800">网络接口</span>
+                <span class="text-[13px] font-medium text-gray-800">
+                  {{ t("proxyModal.interface") }}
+                </span>
                 <HelpTooltip
-                  text="指定连接上游代理时绑定的本机出站网卡；选择「自动」则由 Windows 系统路由表决定出口网卡（本地 127.0.0.1 代理无需绑定）。"
+                  :text="
+                    isDirectInterface
+                      ? t('proxyModal.interfaceDirectHelp')
+                      : t('proxyModal.interfaceProxyHelp')
+                  "
                 />
               </div>
               <SelectMenu
                 v-model="form.interfaceName"
                 :options="interfaceOptions"
+                :placeholder="isDirectInterface ? t('proxyModal.interfacePlaceholder') : t('common.auto')"
                 variant="inline"
               />
             </div>
           </div>
         </div>
 
-        <!-- Footer: left Cancel, right Save -->
         <div
           class="flex items-center justify-between border-t border-gray-200/75 bg-white px-5 py-3"
         >
@@ -347,7 +451,7 @@ function submit() {
             class="rounded-lg bg-[#EFEFF2] px-4 py-1.5 text-[13px] font-medium text-gray-800 transition hover:bg-[#E5E5EA]"
             @click="emit('close')"
           >
-            取消
+            {{ t("common.cancel") }}
           </button>
           <button
             type="button"
@@ -360,7 +464,7 @@ function submit() {
             "
             @click="submit"
           >
-            保存
+            {{ t("common.save") }}
           </button>
         </div>
       </div>

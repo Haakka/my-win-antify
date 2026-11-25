@@ -4,14 +4,21 @@ import {
   TAURI_EVENTS,
   type ActivityLogEntry,
   type AppConfig,
+  type CoexistenceConflict,
+  type ConfigBackupExport,
   type ConnectionSnapshot,
+  type CurrentWifiInfo,
+  type DiagnosticBundleSummary,
   type NetworkInterfaceInfo,
   type PipeConnectionState,
   type PongInfo,
   type ProxyTestResult,
+  type RulesImportPreview,
   type RunningProcessInfo,
   type ServiceStatus,
   type TauriCommandMap,
+  type TrafficHistoryQuery,
+  type TrafficHistoryResponse,
   type TrafficStats,
 } from "@/types";
 import { MockCoreClient } from "./mockClient";
@@ -23,6 +30,8 @@ export interface CoreEventCallbacks {
   onActivityLog: (entry: ActivityLogEntry) => void;
   onConfigChanged: (config: AppConfig) => void;
   onPipeState: (state: PipeConnectionState) => void;
+  onProxyTestsStale: () => void;
+  onWifiChanged: (wifi: CurrentWifiInfo) => void;
 }
 
 export interface CoreClient {
@@ -34,6 +43,7 @@ export interface CoreClient {
   stopEngine(): Promise<ServiceStatus>;
   getConfig(): Promise<AppConfig>;
   saveConfig(config: AppConfig): Promise<AppConfig>;
+  restoreConfigBackup(): Promise<AppConfig>;
   setActiveProfile(profileId: string): Promise<AppConfig>;
   getConnections(
     includeClosed: boolean,
@@ -46,6 +56,20 @@ export interface CoreClient {
   getActivityLogs(limit: number | null): Promise<ActivityLogEntry[]>;
   clearActivityLogs(): Promise<void>;
   launchService(): Promise<boolean>;
+  exportConfigBackup(includePasswords: boolean): Promise<ConfigBackupExport>;
+  importConfigBackup(json: string): Promise<AppConfig>;
+  exportRulesJson(profileId: string | null): Promise<string>;
+  importRulesJson(
+    json: string,
+    profileId: string,
+    dryRun: boolean,
+  ): Promise<RulesImportPreview>;
+  getTrafficHistory(query: TrafficHistoryQuery): Promise<TrafficHistoryResponse>;
+  clearTrafficHistory(): Promise<void>;
+  getCurrentWifi(): Promise<CurrentWifiInfo>;
+  getCoexistenceConflicts(): Promise<CoexistenceConflict[]>;
+  dismissCoexistenceConflict(conflictId: string): Promise<void>;
+  collectDiagnosticBundle(outputPath: string | null): Promise<DiagnosticBundleSummary>;
 }
 
 export function isTauriRuntime(): boolean {
@@ -98,6 +122,16 @@ export class TauriCoreClient implements CoreClient {
         callbacks.onPipeState(e.payload),
       ),
     );
+    unlisteners.push(
+      await listen<void>(TAURI_EVENTS.PROXY_TESTS_STALE, () =>
+        callbacks.onProxyTestsStale(),
+      ),
+    );
+    unlisteners.push(
+      await listen<CurrentWifiInfo>(TAURI_EVENTS.WIFI_CHANGED, (e) =>
+        callbacks.onWifiChanged(e.payload),
+      ),
+    );
     return () => {
       for (const fn of unlisteners) {
         fn();
@@ -126,6 +160,9 @@ export class TauriCoreClient implements CoreClient {
   saveConfig(config: AppConfig) {
     return tauriInvoke("core_save_config", { config });
   }
+  restoreConfigBackup() {
+    return tauriInvoke("core_restore_config_backup");
+  }
   setActiveProfile(profileId: string) {
     return tauriInvoke("core_set_active_profile", { profileId });
   }
@@ -152,6 +189,36 @@ export class TauriCoreClient implements CoreClient {
   }
   launchService() {
     return tauriInvoke("core_launch_service");
+  }
+  exportConfigBackup(includePasswords: boolean) {
+    return tauriInvoke("core_export_config_backup", { includePasswords });
+  }
+  importConfigBackup(json: string) {
+    return tauriInvoke("core_import_config_backup", { json });
+  }
+  exportRulesJson(profileId: string | null) {
+    return tauriInvoke("core_export_rules_json", { profileId });
+  }
+  importRulesJson(json: string, profileId: string, dryRun: boolean) {
+    return tauriInvoke("core_import_rules_json", { json, profileId, dryRun });
+  }
+  getTrafficHistory(query: TrafficHistoryQuery) {
+    return tauriInvoke("core_get_traffic_history", { query });
+  }
+  clearTrafficHistory() {
+    return tauriInvoke("core_clear_traffic_history");
+  }
+  getCurrentWifi() {
+    return tauriInvoke("core_get_current_wifi");
+  }
+  getCoexistenceConflicts() {
+    return tauriInvoke("core_get_coexistence_conflicts");
+  }
+  dismissCoexistenceConflict(conflictId: string) {
+    return tauriInvoke("core_dismiss_coexistence_conflict", { conflictId });
+  }
+  collectDiagnosticBundle(outputPath: string | null) {
+    return tauriInvoke("core_collect_diagnostic_bundle", { outputPath });
   }
 }
 

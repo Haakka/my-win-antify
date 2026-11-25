@@ -2,10 +2,12 @@
 import { ref } from "vue";
 import { Globe, ListChecks, Pencil, Plus, Trash2 } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
+import { useI18n } from "@/i18n";
 import type { Profile } from "@/types";
 import ProfileFormModal from "@/components/ProfileFormModal.vue";
 
 const store = useAppStore();
+const { t } = useI18n();
 const modalOpen = ref(false);
 const editing = ref<Profile | null>(null);
 
@@ -33,11 +35,11 @@ async function handleSave(prof: Profile) {
   <div class="space-y-4">
     <div class="flex items-center justify-between">
       <h1 class="text-[18px] font-semibold tracking-tight text-gray-900">
-        配置
+        {{ t("profiles.title") }}
       </h1>
       <button
         type="button"
-        title="新增配置"
+        :title="t('profiles.addProfile')"
         class="inline-flex h-7 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-700 transition hover:bg-gray-50"
         @click="openCreate"
       >
@@ -72,25 +74,19 @@ async function handleSave(prof: Profile) {
                 v-if="prof.id === store.activeProfile.id"
                 class="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
               >
-                已启用
+                {{ t("profiles.activeBadge") }}
               </span>
             </div>
             <div class="mt-1 flex items-center gap-3 text-[12px] text-gray-500">
               <span class="inline-flex items-center gap-1">
                 <ListChecks class="h-3.5 w-3.5" />
-                {{ ruleCountFor(prof.id) }} 条规则
+                {{ t("profiles.ruleCount", { count: ruleCountFor(prof.id) }) }}
               </span>
               <span
                 class="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
               >
-                默认:
-                {{
-                  prof.defaultAction === "direct"
-                    ? "直连"
-                    : prof.defaultAction === "proxy"
-                      ? "代理"
-                      : "阻断"
-                }}
+                {{ t("profiles.defaultPrefix") }}
+                {{ t(`common.${prof.defaultAction}`) }}
               </span>
             </div>
           </div>
@@ -99,6 +95,7 @@ async function handleSave(prof: Profile) {
         <div class="flex items-center gap-2" @click.stop>
           <button
             type="button"
+            :title="t('common.edit')"
             class="rounded-lg p-1.5 text-gray-500 transition hover:bg-gray-100 hover:text-gray-800"
             @click="openEdit(prof)"
           >
@@ -107,6 +104,7 @@ async function handleSave(prof: Profile) {
           <button
             v-if="store.config.profiles.length > 1"
             type="button"
+            :title="t('common.delete')"
             class="rounded-lg p-1.5 text-red-400 transition hover:bg-red-50 hover:text-red-600"
             @click="store.deleteProfile(prof.id)"
           >

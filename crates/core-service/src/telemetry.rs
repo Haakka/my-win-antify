@@ -6,14 +6,17 @@ use std::{
 
 use shared::{
     ActivityLogEntry, ConnectionProtocol, ConnectionSnapshot, ConnectionState, IpcEvent,
-    LogCategory, LogLevel, RuleAction, RuleMatchTick, ServiceStatus, TrafficStats,
+    LogCategory, LogLevel, ProxyConfig, RuleAction, RuleMatchTick, ServiceStatus, TrafficStats,
 };
 use tokio::sync::broadcast;
 
 use crate::{
+    health::Health,
     now_ms,
     packet::FlowKey,
     process::{normalized_path, Decision, Process},
+    traffic_history::TrafficHistory,
+    upstream::UpstreamError,
 };
 
 const HISTORY_LIMIT: usize = 1000;
@@ -21,6 +24,7 @@ const HISTORY_LIMIT: usize = 1000;
 pub(crate) struct Telemetry {
     pub events: broadcast::Sender<IpcEvent>,
     state: Mutex<State>,
+    pub traffic_history: Option<TrafficHistory>,
 }
 
 struct State {
@@ -31,10 +35,12 @@ struct State {
     last_matches: HashMap<String, i64>,
     totals: Totals,
     sample: Option<(Instant, Totals)>,
+    health: Health,
 }
 
 struct Live {
     snapshot: ConnectionSnapshot,
+    profile_id: Option<String>,
     app_key: String,
     visible: bool,
     managed: bool,
@@ -50,10 +56,11 @@ struct Totals {
 }
 
 impl Telemetry {
-    pub fn new() -> Arc<Self> {
+    pub fn new(traffic_history: Option<TrafficHistory>) -> Arc<Self> {
         let (events, _) = broadcast::channel(512);
         Arc::new(Self {
             events,
+            traffic_history,
             state: Mutex::new(State {
                 next_id: 1,
                 active: HashMap::new(),
@@ -62,11 +69,60 @@ impl Telemetry {
                 last_matches: HashMap::new(),
                 totals: Totals::default(),
                 sample: None,
+                health: Health::default(),
             }),
         })
     }
 
-    pub fn open(&self, key: FlowKey, process: &Process, decision: &Decision, visible: bool) -> u64 {
+    pub fn open(
+        &self,
+        key: FlowKey,
+        process: &Process,
+        decision: &Decision,
+        visible: bool,
+        profile_id: Option<&str>,
+    ) -> u64 {
+        self.open_connection(
+            key,
+            process,
+            decision,
+            visible,
+            ConnectionProtocol::Tcp,
+            None,
+            profile_id,
+        )
+    }
+
+    pub fn open_udp(
+        &self,
+        key: FlowKey,
+        process: &Process,
+        decision: &Decision,
+        visible: bool,
+        domain: Option<String>,
+        profile_id: Option<&str>,
+    ) -> u64 {
+        self.open_connection(
+            key,
+            process,
+            decision,
+            visible,
+            ConnectionProtocol::Udp,
+            domain,
+            profile_id,
+        )
+    }
+
+    fn open_connection(
+        &self,
+        key: FlowKey,
+        process: &Process,
+        decision: &Decision,
+        visible: bool,
+        protocol: ConnectionProtocol,
+        domain: Option<String>,
+        profile_id: Option<&str>,
+    ) -> u64 {
         let mut s = self.state.lock().unwrap();
         let id = s.next_id;
         s.next_id += 1;
@@ -81,14 +137,14 @@ impl Telemetry {
         let snapshot = ConnectionSnapshot {
             id,
             timestamp_ms,
-            protocol: ConnectionProtocol::Tcp,
+            protocol,
             pid: process.pid,
             process_name: process.name.clone(),
             executable_path: process.path.clone(),
             app_name: process.app_name(),
             src_addr: key.local.to_string(),
             dst_addr: key.remote.to_string(),
-            domain: None,
+            domain,
             action: decision.action,
             rule_id: decision.rule_id.clone(),
             rule_name: decision.rule_name.clone(),
@@ -102,6 +158,11 @@ impl Telemetry {
             bytes_up: 0,
             bytes_down: 0,
             error: None,
+            match_reason: decision
+                .pending_hosts
+                .is_none()
+                .then(|| decision.match_reason()),
+            failure_code: None,
         };
         // Block is emitted once as a terminal event by finish().
         if visible && decision.action != RuleAction::Block {
@@ -118,6 +179,7 @@ impl Telemetry {
             id,
             Live {
                 snapshot,
+                profile_id: profile_id.map(str::to_owned),
                 visible,
                 app_key,
                 managed: decision.rule_id.is_some() || decision.action != RuleAction::Direct,
@@ -131,6 +193,7 @@ impl Telemetry {
         let mut state = self.state.lock().unwrap();
         if let Some(live) = state.active.get_mut(&id) {
             live.snapshot.domain = Some(domain);
+            live.dirty = true;
         }
     }
 
@@ -150,9 +213,44 @@ impl Telemetry {
             snapshot.rule_name = None;
         }
         live.managed = snapshot.rule_id.is_some() || action != RuleAction::Direct;
+        live.dirty = true;
         if let Some(rule_id) = snapshot.rule_id.clone() {
             state.last_matches.insert(rule_id, crate::now_ms());
         }
+    }
+
+    pub fn route_detail(&self, id: u64, reason: Option<&str>, failure: Option<&str>) {
+        if let Some(live) = self.state.lock().unwrap().active.get_mut(&id) {
+            if let Some(reason) = reason {
+                live.snapshot.match_reason = Some(reason.into());
+            }
+            if let Some(failure) = failure {
+                live.snapshot.failure_code = Some(failure.into());
+            }
+            live.dirty = true;
+        }
+    }
+
+    pub fn health_generation(&self) -> u64 {
+        self.state.lock().unwrap().health.generation()
+    }
+
+    pub fn record_proxy_result(
+        &self,
+        proxy: &ProxyConfig,
+        generation: u64,
+        result: Result<(), &UpstreamError>,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .health
+            .record(proxy, generation, result);
+    }
+
+    pub fn mark_proxy_tests_stale(&self) {
+        self.state.lock().unwrap().health.mark_stale();
+        let _ = self.events.send(IpcEvent::ProxyTestsStale);
     }
 
     pub fn activate(&self, id: u64) {
@@ -179,6 +277,18 @@ impl Telemetry {
         live.snapshot.bytes_up += up;
         live.snapshot.bytes_down += down;
         live.dirty = true;
+        if let Some(history) = self.traffic_history.as_ref().filter(|_| {
+            live.snapshot.action == RuleAction::Proxy
+                || (live.snapshot.action == RuleAction::Direct && live.managed)
+        }) {
+            history.record(
+                now_ms(),
+                live.profile_id.as_deref(),
+                &live.snapshot,
+                up,
+                down,
+            );
+        }
         match live.snapshot.action {
             RuleAction::Proxy => {
                 s.totals.proxy_up += up;
@@ -275,13 +385,11 @@ impl Telemetry {
         self.state.lock().unwrap().logs.clear();
     }
 
-    pub fn retain_rules(&self, config: &shared::AppConfig) {
+    pub fn update_config(&self, config: &shared::AppConfig) {
         let ids: HashSet<_> = config.rules.iter().map(|rule| rule.id.as_str()).collect();
-        self.state
-            .lock()
-            .unwrap()
-            .last_matches
-            .retain(|id, _| ids.contains(id.as_str()));
+        let mut state = self.state.lock().unwrap();
+        state.last_matches.retain(|id, _| ids.contains(id.as_str()));
+        state.health.sync_proxies(&config.proxies);
     }
 
     pub fn tick(&self, status: &ServiceStatus) {
@@ -352,6 +460,7 @@ impl Telemetry {
             total_direct_up: totals.direct_up,
             total_direct_down: totals.direct_down,
             rule_last_matched,
+            proxy_health: s.health.snapshots(),
         }));
     }
 }
@@ -377,6 +486,8 @@ mod tests {
             driver_ready: true,
             active_profile_id: "default".into(),
             last_error: None,
+            config_error: None,
+            invalid_rule_ids: Vec::new(),
         }
     }
 
@@ -389,6 +500,7 @@ mod tests {
             &Process::unknown(pid),
             decision,
             visible,
+            None,
         )
     }
 
@@ -409,7 +521,7 @@ mod tests {
 
     #[test]
     fn ticks_count_managed_connections_and_publish_visible_dirty_bytes_once() {
-        let telemetry = Telemetry::new();
+        let telemetry = Telemetry::new(None);
         let direct_rule = Decision {
             rule_id: Some("direct".into()),
             ..Decision::direct()
@@ -468,8 +580,56 @@ mod tests {
     }
 
     #[test]
+    fn health_uses_twenty_real_outcomes_and_marks_old_generation_stale() {
+        use shared::{AppConfig, ProxyHealthStatus, ProxyProtocol};
+        use std::io;
+
+        let telemetry = Telemetry::new(None);
+        let proxy = crate::upstream::mock_proxy(ProxyProtocol::Socks5, 1080);
+        let mut config = AppConfig::default();
+        config.proxies.push(proxy.clone());
+        telemetry.update_config(&config);
+        let generation = telemetry.health_generation();
+        let mut events = telemetry.events.subscribe();
+        let health = |events: &mut _| tick_events(&telemetry, events).0.proxy_health.remove(0);
+        assert_eq!(health(&mut events).status, ProxyHealthStatus::Unknown);
+        let refused = UpstreamError::destination(io::Error::from(io::ErrorKind::ConnectionRefused));
+        telemetry.record_proxy_result(&proxy, generation, Err(&refused));
+        assert_eq!(health(&mut events).status, ProxyHealthStatus::Unknown);
+        telemetry.record_proxy_result(&proxy, generation, Ok(()));
+        let auth = UpstreamError::proxy(
+            "auth_failed",
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        telemetry.record_proxy_result(&proxy, generation, Err(&auth));
+        let snapshot = health(&mut events);
+        assert_eq!(snapshot.status, ProxyHealthStatus::Degraded);
+        assert_eq!(snapshot.score, 50);
+        assert_eq!(snapshot.last_error_code.as_deref(), Some("auth_failed"));
+        let timeout = UpstreamError::timeout("upstream timed out");
+        telemetry.record_proxy_result(&proxy, generation, Err(&timeout));
+        let snapshot = health(&mut events);
+        assert_eq!(snapshot.score, 33);
+        assert_eq!(snapshot.last_error_code.as_deref(), Some("timeout"));
+        for _ in 0..20 {
+            telemetry.record_proxy_result(&proxy, generation, Ok(()));
+        }
+        let snapshot = health(&mut events);
+        assert_eq!(snapshot.status, ProxyHealthStatus::Healthy);
+        assert_eq!(snapshot.score, 100);
+        assert_eq!(snapshot.last_error, None);
+
+        telemetry.mark_proxy_tests_stale();
+        assert_eq!(events.try_recv().unwrap(), IpcEvent::ProxyTestsStale);
+        telemetry.record_proxy_result(&proxy, generation, Ok(()));
+        assert_eq!(health(&mut events).status, ProxyHealthStatus::Stale);
+        telemetry.record_proxy_result(&proxy, telemetry.health_generation(), Err(&timeout));
+        assert_eq!(health(&mut events).status, ProxyHealthStatus::Unreachable);
+    }
+
+    #[test]
     fn tick_saturates_rate_deltas_if_counters_decrease() {
-        let telemetry = Telemetry::new();
+        let telemetry = Telemetry::new(None);
         let mut events = telemetry.events.subscribe();
         telemetry.state.lock().unwrap().sample = Some((
             Instant::now(),
@@ -486,7 +646,7 @@ mod tests {
 
     #[test]
     fn clear_logs_empties_history_and_keeps_subsequent_entries() {
-        let telemetry = Telemetry::new();
+        let telemetry = Telemetry::new(None);
         telemetry.log(LogLevel::Info, LogCategory::App, "Before clear", None);
         assert_eq!(telemetry.logs(None).len(), 1);
         telemetry.clear_logs();

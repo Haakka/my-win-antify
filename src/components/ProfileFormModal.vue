@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { reactive, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
+import { AlertTriangle } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
+import { useI18n } from "@/i18n";
 import type { Profile, RuleAction } from "@/types";
 import { randomId } from "@/utils/format";
 import ModalDialog from "./ModalDialog.vue";
@@ -16,6 +18,7 @@ const emit = defineEmits<{
 }>();
 
 const store = useAppStore();
+const { t } = useI18n();
 
 const form = reactive({
   name: "",
@@ -23,6 +26,14 @@ const form = reactive({
   defaultProxyId: "",
 });
 const validationError = ref<string | null>(null);
+
+const duplicateNameWarn = computed(() => {
+  const nameLower = form.name.trim().toLowerCase();
+  if (!nameLower) return false;
+  return store.config.profiles.some(
+    (p) => p.id !== props.editing?.id && p.name.trim().toLowerCase() === nameLower,
+  );
+});
 
 watch(
   () => [props.open, props.editing] as const,
@@ -44,7 +55,7 @@ watch(
 
 function submit() {
   if (!form.name.trim()) {
-    validationError.value = "请输入配置名称";
+    validationError.value = t("profiles.errName");
     return;
   }
   emit("save", {
@@ -62,7 +73,7 @@ function submit() {
 <template>
   <ModalDialog
     :open="open"
-    :title="editing ? '编辑配置' : '新增配置'"
+    :title="editing ? t('profiles.modalEdit') : t('profiles.modalAdd')"
     @close="emit('close')"
   >
     <div class="space-y-4">
@@ -73,35 +84,43 @@ function submit() {
         {{ validationError }}
       </div>
 
+      <div
+        v-if="duplicateNameWarn"
+        class="flex items-center gap-2 rounded-lg bg-amber-50 px-3 py-2 text-[12px] text-amber-800"
+      >
+        <AlertTriangle class="h-3.5 w-3.5 shrink-0" />
+        <span>{{ t("profiles.dupNameWarn") }}</span>
+      </div>
+
       <div>
         <label class="mb-1 block text-[12px] font-medium text-gray-600">
-          配置名称
+          {{ t("profiles.nameLabel") }}
         </label>
         <input
           v-model="form.name"
           type="text"
-          placeholder="例如：Work / General"
+          :placeholder="t('profiles.namePlaceholder')"
           class="w-full rounded-lg border border-gray-200 px-3 py-2 text-[13px] outline-none focus:border-[#0A7AFF]"
         />
       </div>
 
       <div>
         <label class="mb-1 block text-[12px] font-medium text-gray-600">
-          未命中规则时的默认策略
+          {{ t("profiles.defaultStrategy") }}
         </label>
         <select
           v-model="form.defaultAction"
           class="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] outline-none focus:border-[#0A7AFF]"
         >
-          <option value="direct">直连 (Direct)</option>
-          <option value="proxy">代理 (Proxy)</option>
-          <option value="block">阻断 (TCP RST)</option>
+          <option value="direct">{{ t("profiles.strategyDirect") }}</option>
+          <option value="proxy">{{ t("profiles.strategyProxy") }}</option>
+          <option value="block">{{ t("profiles.strategyBlock") }}</option>
         </select>
       </div>
 
       <div v-if="form.defaultAction === 'proxy'">
         <label class="mb-1 block text-[12px] font-medium text-gray-600">
-          默认代理节点
+          {{ t("profiles.defaultProxy") }}
         </label>
         <select
           v-model="form.defaultProxyId"
@@ -112,7 +131,11 @@ function submit() {
             :key="proxy.id"
             :value="proxy.id"
           >
-            {{ proxy.name }} ({{ proxy.host }}:{{ proxy.port }})
+            {{
+              proxy.protocol === "directInterface"
+                ? `${proxy.name} (${proxy.interfaceName ?? "NIC"})`
+                : `${proxy.name} (${proxy.host}:${proxy.port})`
+            }}
           </option>
         </select>
       </div>
@@ -124,14 +147,14 @@ function submit() {
         class="rounded-lg border border-gray-200 bg-white px-3.5 py-1.5 text-[12.5px] font-medium text-gray-700 hover:bg-gray-50"
         @click="emit('close')"
       >
-        取消
+        {{ t("common.cancel") }}
       </button>
       <button
         type="button"
         class="rounded-lg bg-[#0A7AFF] px-4 py-1.5 text-[12.5px] font-medium text-white hover:bg-blue-600"
         @click="submit"
       >
-        保存
+        {{ t("common.save") }}
       </button>
     </template>
   </ModalDialog>

@@ -11,21 +11,23 @@ import {
   Trash2,
 } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
-import type { LogCategory, LogLevel } from "@/types";
+import { useI18n } from "@/i18n";
+import type { ActivityLogEntry, LogCategory, LogLevel } from "@/types";
 import { formatDateTimeShort } from "@/utils/format";
 import SelectMenu, { type SelectOption } from "@/components/SelectMenu.vue";
 
 const store = useAppStore();
+const { locale, t } = useI18n();
 const searchQuery = ref("");
 const levelFilter = ref<"all" | LogLevel>("all");
 const copied = ref(false);
 
-const levelOptions: SelectOption[] = [
-  { value: "all", label: "全部" },
+const levelOptions = computed<SelectOption[]>(() => [
+  { value: "all", label: t("activity.all") },
   { value: "info", label: "Info" },
   { value: "warn", label: "Warn" },
   { value: "error", label: "Error" },
-];
+]);
 
 onMounted(() => {
   void store.refreshActivityLogs();
@@ -45,12 +47,44 @@ const filteredLogs = computed(() => {
   });
 });
 
-const categoryLabel: Record<LogCategory, string> = {
-  service: "引擎",
-  proxy: "代理",
-  rule: "规则",
-  app: "应用",
-};
+interface FoldedLogEntry {
+  entry: ActivityLogEntry;
+  count: number;
+}
+
+const foldedLogs = computed<FoldedLogEntry[]>(() => {
+  const groups: FoldedLogEntry[] = [];
+  for (const entry of filteredLogs.value) {
+    const sec = Math.floor(entry.timestampMs / 1000);
+    const prev = groups[groups.length - 1];
+    if (
+      prev &&
+      Math.floor(prev.entry.timestampMs / 1000) === sec &&
+      prev.entry.level === entry.level &&
+      prev.entry.category === entry.category &&
+      prev.entry.title === entry.title &&
+      (prev.entry.detail ?? "") === (entry.detail ?? "")
+    ) {
+      prev.count += 1;
+    } else {
+      groups.push({ entry, count: 1 });
+    }
+  }
+  return groups;
+});
+
+function categoryLabel(category: LogCategory): string {
+  switch (category) {
+    case "service":
+      return t("activity.catService");
+    case "proxy":
+      return t("activity.catProxy");
+    case "rule":
+      return t("activity.catRule");
+    case "app":
+      return t("activity.catApp");
+  }
+}
 
 const categoryClass: Record<LogCategory, string> = {
   service: "bg-purple-100/80 text-purple-700",
@@ -60,9 +94,9 @@ const categoryClass: Record<LogCategory, string> = {
 };
 
 async function copyLogs() {
-  const lines = filteredLogs.value.map(
-    (e) =>
-      `[${formatDateTimeShort(e.timestampMs)}] [${e.level.toUpperCase()}] [${categoryLabel[e.category]}] ${e.title}${e.detail ? ` — ${e.detail}` : ""}`,
+  const lines = foldedLogs.value.map(
+    ({ entry, count }) =>
+      `[${formatDateTimeShort(entry.timestampMs, locale.value)}] [${entry.level.toUpperCase()}] [${categoryLabel(entry.category)}] ${entry.title}${entry.detail ? ` — ${entry.detail}` : ""}${count > 1 ? ` (×${count})` : ""}`,
   );
   try {
     await navigator.clipboard.writeText(lines.join("\n"));
@@ -71,7 +105,7 @@ async function copyLogs() {
       copied.value = false;
     }, 1500);
   } catch {
-    // Clipboard unavailable in restricted context.
+    // Clipboard unavailable.
   }
 }
 </script>
@@ -79,7 +113,7 @@ async function copyLogs() {
 <template>
   <div class="space-y-4">
     <h1 class="text-[18px] font-semibold tracking-tight text-gray-900">
-      活动
+      {{ t("activity.title") }}
     </h1>
 
     <div class="flex flex-wrap items-center justify-between gap-3">
@@ -88,13 +122,13 @@ async function copyLogs() {
         <input
           v-model="searchQuery"
           type="text"
-          placeholder="搜索日志..."
+          :placeholder="t('activity.searchPlaceholder')"
           class="w-full rounded-lg border border-gray-200 bg-white py-1.5 pl-8 pr-3 text-[12.5px] outline-none focus:border-[#0A7AFF]"
         />
       </div>
 
       <div class="flex items-center gap-2 text-[12.5px] text-gray-600">
-        <span>级别</span>
+        <span>{{ t("activity.level") }}</span>
         <SelectMenu
           :model-value="levelFilter"
           :options="levelOptions"
@@ -104,7 +138,7 @@ async function copyLogs() {
 
         <button
           type="button"
-          title="复制当前日志"
+          :title="t('activity.copyLogs')"
           class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-500 transition hover:bg-gray-50 hover:text-gray-800"
           @click="copyLogs"
         >
@@ -114,7 +148,7 @@ async function copyLogs() {
 
         <button
           type="button"
-          title="刷新日志"
+          :title="t('activity.refreshLogs')"
           class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-500 transition hover:bg-gray-50 hover:text-gray-800"
           @click="store.refreshActivityLogs()"
         >
@@ -123,7 +157,7 @@ async function copyLogs() {
 
         <button
           type="button"
-          title="清空日志"
+          :title="t('activity.clearLogs')"
           class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-500 transition hover:bg-gray-50 hover:text-red-600"
           @click="store.clearActivityLogs()"
         >
@@ -132,49 +166,56 @@ async function copyLogs() {
       </div>
     </div>
 
-    <div class="antify-card divide-y divide-gray-100 overflow-hidden">
+    <div class="antify-card divide-y divide-gray-100 overflow-hidden select-text">
       <div
-        v-for="entry in filteredLogs"
-        :key="entry.id"
+        v-for="item in foldedLogs"
+        :key="item.entry.id"
         class="flex items-center justify-between gap-3 px-4 py-2 text-[12.5px]"
       >
         <div class="flex min-w-0 items-center gap-2.5">
           <Info
-            v-if="entry.level === 'info'"
+            v-if="item.entry.level === 'info'"
             class="h-4 w-4 shrink-0 text-[#0A7AFF]"
           />
           <AlertTriangle
-            v-else-if="entry.level === 'warn'"
+            v-else-if="item.entry.level === 'warn'"
             class="h-4 w-4 shrink-0 text-amber-500"
           />
           <AlertCircle v-else class="h-4 w-4 shrink-0 text-red-500" />
 
           <span class="shrink-0 font-mono text-[11.5px] text-gray-400">
-            {{ formatDateTimeShort(entry.timestampMs) }}
+            {{ formatDateTimeShort(item.entry.timestampMs, locale) }}
           </span>
 
           <span
             class="shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium"
-            :class="categoryClass[entry.category]"
+            :class="categoryClass[item.entry.category]"
           >
-            {{ categoryLabel[entry.category] }}
+            {{ categoryLabel(item.entry.category) }}
           </span>
 
           <span class="truncate font-medium text-gray-900">
-            {{ entry.title }}
+            {{ item.entry.title }}
+          </span>
+
+          <span
+            v-if="item.count > 1"
+            class="shrink-0 rounded-full bg-gray-200/80 px-1.5 py-0.5 font-mono text-[10.5px] font-semibold text-gray-700"
+          >
+            ×{{ item.count }}
           </span>
         </div>
 
         <span class="truncate text-[12px] text-gray-400">
-          {{ entry.detail ?? "" }}
+          {{ item.entry.detail ?? "" }}
         </span>
       </div>
 
       <div
-        v-if="filteredLogs.length === 0"
+        v-if="foldedLogs.length === 0"
         class="py-10 text-center text-[13px] text-gray-400"
       >
-        暂无活动日志
+        {{ t("activity.empty") }}
       </div>
     </div>
   </div>

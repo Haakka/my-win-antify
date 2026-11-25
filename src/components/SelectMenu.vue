@@ -84,7 +84,9 @@ function onPointerDown(ev: MouseEvent) {
 
 function onKeyDown(ev: KeyboardEvent) {
   if (open.value && ev.key === "Escape") {
+    ev.preventDefault();
     ev.stopPropagation();
+    ev.stopImmediatePropagation();
     open.value = false;
   }
 }

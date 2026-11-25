@@ -106,6 +106,99 @@ impl Packet {
     }
 }
 
+pub(crate) const MAX_UDP_PAYLOAD: usize = u16::MAX as usize - 28;
+
+pub(crate) struct UdpPacket<'a> {
+    pub key: FlowKey,
+    pub payload: &'a [u8],
+}
+
+impl<'a> UdpPacket<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < 28 || bytes[0] >> 4 != 4 || bytes[9] != 17 || word(bytes, 6) & 0x3fff != 0
+        {
+            return None;
+        }
+        let ip_header = usize::from(bytes[0] & 0x0f) * 4;
+        let total = usize::from(word(bytes, 2));
+        if ip_header < 20 || total > bytes.len() || total < ip_header + 8 {
+            return None;
+        }
+        let udp_len = usize::from(word(bytes, ip_header + 4));
+        if udp_len < 8 || ip_header + udp_len != total {
+            return None;
+        }
+        let key = FlowKey {
+            local: SocketAddrV4::new(Ipv4Addr::from(octets(bytes, 12)), word(bytes, ip_header)),
+            remote: SocketAddrV4::new(
+                Ipv4Addr::from(octets(bytes, 16)),
+                word(bytes, ip_header + 2),
+            ),
+        };
+        Some(Self {
+            key,
+            payload: &bytes[ip_header + 8..total],
+        })
+    }
+}
+
+pub(crate) fn build_inbound_udp(
+    remote: SocketAddrV4,
+    local: SocketAddrV4,
+    payload: &[u8],
+) -> Vec<u8> {
+    if payload.len() > MAX_UDP_PAYLOAD {
+        return Vec::new();
+    }
+    let total = (28 + payload.len()) as u16;
+    let mut bytes = vec![0; usize::from(total)];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&total.to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 17;
+    bytes[12..16].copy_from_slice(&remote.ip().octets());
+    bytes[16..20].copy_from_slice(&local.ip().octets());
+    bytes[20..22].copy_from_slice(&remote.port().to_be_bytes());
+    bytes[22..24].copy_from_slice(&local.port().to_be_bytes());
+    bytes[24..26].copy_from_slice(&(total - 20).to_be_bytes());
+    bytes[28..].copy_from_slice(payload);
+    bytes
+}
+
+pub(crate) fn parse_dns_query_name(mut bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 12 || bytes[2] & 0xf8 != 0 || word(bytes, 4) == 0 {
+        return None;
+    }
+    bytes = &bytes[12..];
+    let mut name = String::new();
+    loop {
+        let (&len, remaining) = bytes.split_first()?;
+        if len == 0 {
+            return (remaining.len() >= 4).then(|| if name.is_empty() { ".".into() } else { name });
+        }
+        let len = usize::from(len);
+        if len > 63 || name.len() + len + usize::from(!name.is_empty()) > 253 {
+            return None;
+        }
+        let label = remaining.get(..len)?;
+        if !label
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return None;
+        }
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.extend(
+            label
+                .iter()
+                .map(|byte| char::from(byte.to_ascii_lowercase())),
+        );
+        bytes = &remaining[len..];
+    }
+}
+
 pub(crate) struct PacketV6 {
     pub key: FlowKeyV6,
     payload_len: usize,
@@ -304,6 +397,45 @@ mod tests {
             complement(sum(&bytes[12..20]) + 6 + (bytes.len() - tcp) as u32 + sum(&bytes[tcp..])),
             0
         );
+    }
+
+    #[test]
+    fn dns_qname_validates_the_question_and_normalizes_case() {
+        let query = b"\x00\x05\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03WWW\x07example\x03Org\x00\x00\x01\x00\x01";
+        assert_eq!(
+            parse_dns_query_name(query).as_deref(),
+            Some("www.example.org")
+        );
+        for truncated in 0..query.len() {
+            assert!(parse_dns_query_name(&query[..truncated]).is_none());
+        }
+        let mut malformed = *query;
+        malformed[12] = 0xc0; // A compressed first question cannot refer to an earlier name.
+        assert!(parse_dns_query_name(&malformed).is_none());
+        malformed = *query;
+        malformed[2] |= 0x80;
+        assert!(parse_dns_query_name(&malformed).is_none());
+    }
+
+    #[test]
+    fn udp_packet_validates_lengths_and_rejects_fragments() {
+        let remote = "203.0.113.1:53".parse().unwrap();
+        let local = "192.0.2.1:50000".parse().unwrap();
+        let mut bytes = build_inbound_udp(remote, local, b"test");
+        let parsed = UdpPacket::parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.key,
+            FlowKey {
+                local: remote,
+                remote: local
+            }
+        );
+        assert_eq!(parsed.payload, b"test");
+        bytes[6] = 0x20;
+        assert!(UdpPacket::parse(&bytes).is_none());
+        bytes[6] = 0;
+        bytes[25] = 7;
+        assert!(UdpPacket::parse(&bytes).is_none());
     }
 
     #[test]

@@ -1,12 +1,59 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { ArrowDown, ArrowUp } from "lucide-vue-next";
+import { computed, onMounted, ref } from "vue";
+import { ArrowDown, ArrowUp, Trash2 } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
+import { useI18n } from "@/i18n";
+import type { TrafficHistoryRange } from "@/types";
 import { formatBps, formatBytes } from "@/utils/format";
 import HelpTooltip from "@/components/HelpTooltip.vue";
+import SelectMenu, { type SelectOption } from "@/components/SelectMenu.vue";
 
 const store = useAppStore();
+const { t } = useI18n();
 const breakdownTab = ref<"rule" | "proxy" | "app" | "host">("rule");
+const historyRange = ref<TrafficHistoryRange>("24h");
+const historyProfileId = ref<string>("");
+const hoveredBarIndex = ref<number | null>(null);
+
+const historyProfileOptions = computed<SelectOption[]>(() => [
+  { value: "", label: t("traffic.allProfiles") },
+  ...store.config.profiles.map((p) => ({ value: p.id, label: p.name })),
+]);
+
+onMounted(() => {
+  void loadHistory();
+});
+
+async function loadHistory() {
+  await store.refreshTrafficHistory(
+    historyRange.value,
+    historyProfileId.value || null,
+  );
+}
+
+function switchRange(range: TrafficHistoryRange) {
+  historyRange.value = range;
+  void loadHistory();
+}
+
+function changeHistoryProfile(profileId: string | number) {
+  historyProfileId.value = String(profileId);
+  void loadHistory();
+}
+
+const historyBuckets = computed(() => store.trafficHistory?.buckets ?? []);
+
+const historyMaxTotal = computed(() => {
+  const totals = historyBuckets.value.map(
+    (b) => b.proxiedUp + b.proxiedDown + b.directUp + b.directDown,
+  );
+  return Math.max(1024, ...totals);
+});
+
+const hoveredBucket = computed(() => {
+  if (hoveredBarIndex.value === null) return null;
+  return historyBuckets.value[hoveredBarIndex.value] ?? null;
+});
 
 const CHART_W = 600;
 const CHART_H = 120;
@@ -105,9 +152,9 @@ function buildSmoothPath(points: Point[]): string {
     const b = tangents[i + 1]! / d;
     const s = a * a + b * b;
     if (s > 9) {
-      const t = 3 / Math.sqrt(s);
-      tangents[i] = t * a * d;
-      tangents[i + 1] = t * b * d;
+      const k = 3 / Math.sqrt(s);
+      tangents[i] = k * a * d;
+      tangents[i + 1] = k * b * d;
     }
   }
 
@@ -154,7 +201,10 @@ const hoveredSample = computed(() => {
     xPct: (idx / 59) * 100,
     downYPct: (downPt.y / CHART_H) * 100,
     upYPct: (upPt.y / CHART_H) * 100,
-    timeLabel: secondsAgo === 0 ? "现在" : `${secondsAgo} 秒前`,
+    timeLabel:
+      secondsAgo === 0
+        ? t("traffic.now")
+        : t("traffic.secsAgo", { sec: secondsAgo }),
     downBps: pt.downBps,
     upBps: pt.upBps,
   };
@@ -196,21 +246,21 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
     let label = "";
     if (breakdownTab.value === "rule") {
       key = conn.ruleId ?? "__default__";
-      label = conn.ruleName ?? "默认";
+      label = conn.ruleName ?? t("traffic.defaultLabel");
     } else if (breakdownTab.value === "proxy") {
       if (conn.action === "proxy") {
         key = conn.proxyId ?? "__proxy__";
-        label = conn.proxyName ?? "代理";
+        label = conn.proxyName ?? t("common.proxy");
       } else if (conn.action === "block") {
         key = "__block__";
-        label = "已阻断";
+        label = t("connections.blocked");
       } else {
         key = "__direct__";
-        label = "直连";
+        label = t("common.direct");
       }
     } else if (breakdownTab.value === "app") {
       key = conn.executablePath || conn.processName || conn.appName;
-      label = conn.appName || conn.processName || "未知应用";
+      label = conn.appName || conn.processName || t("traffic.unknownApp");
     } else {
       const host = conn.domain || conn.dstAddr.split(":")[0] || conn.dstAddr;
       key = host;
@@ -243,21 +293,18 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
   <div class="space-y-4">
     <div class="flex items-center justify-between gap-3">
       <h1 class="text-[18px] font-semibold tracking-tight text-gray-900">
-        流量
+        {{ t("traffic.title") }}
       </h1>
       <div class="flex items-center gap-1.5 text-[12px] text-gray-400">
-        <span>只统计经 MyWinAntify 处理的连接。</span>
-        <HelpTooltip
-          text="仅统计经由 MyWinAntify 流量引擎处理（命中规则或代理路由）的连接流量；未启动引擎或系统绕过流量不计入此处。"
-        />
+        <span>{{ t("traffic.scopeNote") }}</span>
+        <HelpTooltip :text="t('traffic.scopeHelp')" />
       </div>
     </div>
 
-    <!-- Summary & 60s Live Chart Card -->
     <div class="antify-card space-y-5 p-5">
       <div class="flex flex-wrap gap-8">
         <div>
-          <div class="text-[11.5px] text-gray-500">经代理</div>
+          <div class="text-[11.5px] text-gray-500">{{ t("traffic.proxied") }}</div>
           <div class="mt-1 flex items-center gap-3 text-[15px] font-semibold text-gray-900">
             <span class="inline-flex items-center gap-1">
               <ArrowUp class="h-3.5 w-3.5 text-orange-500" />
@@ -271,7 +318,7 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
         </div>
 
         <div>
-          <div class="text-[11.5px] text-gray-500">直连</div>
+          <div class="text-[11.5px] text-gray-500">{{ t("traffic.direct") }}</div>
           <div class="mt-1 flex items-center gap-3 text-[15px] font-semibold text-gray-900">
             <span class="inline-flex items-center gap-1">
               <ArrowUp class="h-3.5 w-3.5 text-orange-500" />
@@ -287,22 +334,20 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
 
       <div>
         <div class="mb-2 flex items-center justify-between text-[12px]">
-          <span class="font-semibold text-gray-800">最近 60 秒</span>
+          <span class="font-semibold text-gray-800">{{ t("traffic.last60s") }}</span>
           <div class="flex items-center gap-4 text-gray-600">
             <span class="inline-flex items-center gap-1.5">
               <span class="h-2 w-2 rounded-full bg-blue-500" />
-              下载 {{ formatBps(store.stats.downloadBps) }}
+              {{ t("traffic.download") }} {{ formatBps(store.stats.downloadBps) }}
             </span>
             <span class="inline-flex items-center gap-1.5">
               <span class="h-2 w-2 rounded-full bg-orange-500" />
-              上传 {{ formatBps(store.stats.uploadBps) }}
+              {{ t("traffic.upload") }} {{ formatBps(store.stats.uploadBps) }}
             </span>
           </div>
         </div>
 
-        <div
-          class="rounded-xl border border-gray-100 bg-gray-50/70 px-3 pt-3 pb-2"
-        >
+        <div class="rounded-xl border border-gray-100 bg-gray-50/70 px-3 pt-3 pb-2">
           <div class="flex items-stretch gap-2.5">
             <div
               class="flex h-32 w-14 shrink-0 flex-col justify-between py-0.5 text-right font-mono text-[10px] leading-none text-gray-400 tabular-nums"
@@ -323,29 +368,16 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
                 class="h-full w-full overflow-visible"
               >
                 <defs>
-                  <linearGradient
-                    id="trafficDownAreaGradient"
-                    x1="0"
-                    y1="0"
-                    x2="0"
-                    y2="1"
-                  >
+                  <linearGradient id="trafficDownAreaGradient" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stop-color="#3B82F6" stop-opacity="0.22" />
                     <stop offset="100%" stop-color="#3B82F6" stop-opacity="0.01" />
                   </linearGradient>
-                  <linearGradient
-                    id="trafficUpAreaGradient"
-                    x1="0"
-                    y1="0"
-                    x2="0"
-                    y2="1"
-                  >
+                  <linearGradient id="trafficUpAreaGradient" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stop-color="#F97316" stop-opacity="0.18" />
                     <stop offset="100%" stop-color="#F97316" stop-opacity="0.01" />
                   </linearGradient>
                 </defs>
 
-                <!-- Horizontal dashed gridlines -->
                 <line
                   x1="0"
                   :y1="PAD_TOP"
@@ -376,11 +408,9 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
                   vector-effect="non-scaling-stroke"
                 />
 
-                <!-- Area fills -->
                 <path :d="downAreaPath" fill="url(#trafficDownAreaGradient)" />
                 <path :d="upAreaPath" fill="url(#trafficUpAreaGradient)" />
 
-                <!-- Continuous smooth lines -->
                 <path
                   :d="downLinePath"
                   fill="none"
@@ -401,7 +431,6 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
                 />
               </svg>
 
-              <!-- Hover hairline, markers, and floating tooltip -->
               <template v-if="hoveredSample">
                 <div
                   class="pointer-events-none absolute top-0 bottom-0 w-px bg-gray-300/90 dark:bg-white/25"
@@ -434,38 +463,187 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
                   </div>
                   <div class="flex items-center gap-1.5 font-mono text-gray-800">
                     <span class="h-1.5 w-1.5 rounded-full bg-blue-500" />
-                    下载 {{ formatBps(hoveredSample.downBps) }}
+                    {{ t("traffic.download") }} {{ formatBps(hoveredSample.downBps) }}
                   </div>
                   <div class="flex items-center gap-1.5 font-mono text-gray-800">
                     <span class="h-1.5 w-1.5 rounded-full bg-orange-500" />
-                    上传 {{ formatBps(hoveredSample.upBps) }}
+                    {{ t("traffic.upload") }} {{ formatBps(hoveredSample.upBps) }}
                   </div>
                 </div>
               </template>
             </div>
           </div>
 
-          <div
-            class="mt-1.5 flex items-center justify-between pl-16.5 text-[10px] text-gray-400"
-          >
-            <span>60 秒前</span>
-            <span>30 秒前</span>
-            <span>现在</span>
+          <div class="mt-1.5 flex items-center justify-between pl-16.5 text-[10px] text-gray-400">
+            <span>{{ t("traffic.s60Ago") }}</span>
+            <span>{{ t("traffic.s30Ago") }}</span>
+            <span>{{ t("traffic.now") }}</span>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Breakdown Table Card (Rule / Proxy / App / Host) -->
+    <div class="antify-card space-y-4 p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="flex items-center gap-3">
+          <span class="text-[14px] font-semibold text-gray-900">
+            {{ t("traffic.historyTitle") }}
+          </span>
+          <div class="inline-flex rounded-lg bg-[#EFEFF2] p-0.5 text-[12px]">
+            <button
+              type="button"
+              class="rounded-md px-2.5 py-1 font-medium transition"
+              :class="
+                historyRange === '24h'
+                  ? 'bg-[#0A7AFF] text-white shadow-2xs'
+                  : 'text-gray-600 hover:text-gray-900'
+              "
+              @click="switchRange('24h')"
+            >
+              {{ t("traffic.range24h") }}
+            </button>
+            <button
+              type="button"
+              class="rounded-md px-2.5 py-1 font-medium transition"
+              :class="
+                historyRange === 'month'
+                  ? 'bg-[#0A7AFF] text-white shadow-2xs'
+                  : 'text-gray-600 hover:text-gray-900'
+              "
+              @click="switchRange('month')"
+            >
+              {{ t("traffic.rangeMonth") }}
+            </button>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <SelectMenu
+            :model-value="historyProfileId"
+            :options="historyProfileOptions"
+            variant="pill"
+            @update:model-value="changeHistoryProfile"
+          />
+          <button
+            type="button"
+            :title="t('traffic.clearHistory')"
+            class="inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2.5 py-1 text-[12px] text-gray-600 transition hover:bg-gray-50 hover:text-red-600"
+            @click="store.clearTrafficHistory()"
+          >
+            <Trash2 class="h-3.5 w-3.5" />
+            {{ t("traffic.clearHistory") }}
+          </button>
+        </div>
+      </div>
+
+      <div
+        v-if="store.trafficHistory"
+        class="flex flex-wrap items-center gap-6 text-[12px] text-gray-600"
+      >
+        <span>
+          {{ t("traffic.historyProxiedTotal") }}
+          <strong class="text-gray-900">
+            {{
+              formatBytes(
+                store.trafficHistory.totalProxiedUp +
+                  store.trafficHistory.totalProxiedDown,
+              )
+            }}
+          </strong>
+        </span>
+        <span>
+          {{ t("traffic.historyDirectTotal") }}
+          <strong class="text-gray-900">
+            {{
+              formatBytes(
+                store.trafficHistory.totalDirectUp +
+                  store.trafficHistory.totalDirectDown,
+              )
+            }}
+          </strong>
+        </span>
+      </div>
+
+      <div
+        v-if="historyBuckets.length > 0"
+        class="relative rounded-xl border border-gray-100 bg-gray-50/70 px-3 pt-4 pb-2"
+      >
+        <div
+          v-if="hoveredBucket"
+          class="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-1.5 text-[11.5px] shadow-2xs dark:bg-[#22252D]"
+        >
+          <span class="font-semibold text-gray-800">{{ hoveredBucket.label }}</span>
+          <div class="flex items-center gap-4 font-mono text-gray-600">
+            <span>
+              {{ t("common.proxy") }}: ↑{{ formatBytes(hoveredBucket.proxiedUp) }} ↓{{
+                formatBytes(hoveredBucket.proxiedDown)
+              }}
+            </span>
+            <span>
+              {{ t("common.direct") }}: ↑{{ formatBytes(hoveredBucket.directUp) }} ↓{{
+                formatBytes(hoveredBucket.directDown)
+              }}
+            </span>
+          </div>
+        </div>
+
+        <div class="flex h-28 items-end gap-1">
+          <div
+            v-for="(bucket, idx) in historyBuckets"
+            :key="bucket.bucketStartMs"
+            class="group flex h-full flex-1 flex-col items-center justify-end"
+            @mouseenter="hoveredBarIndex = idx"
+            @mouseleave="hoveredBarIndex = null"
+          >
+            <div class="flex w-full flex-1 flex-col justify-end gap-[1px]">
+              <div
+                class="w-full rounded-t-xs bg-[#0A7AFF]/85 transition-all group-hover:bg-[#0A7AFF]"
+                :style="{
+                  height: `${Math.max(
+                    bucket.proxiedUp + bucket.proxiedDown > 0 ? 3 : 0,
+                    ((bucket.proxiedUp + bucket.proxiedDown) / historyMaxTotal) *
+                      100,
+                  )}%`,
+                }"
+              />
+              <div
+                class="w-full rounded-b-xs bg-emerald-500/80 transition-all group-hover:bg-emerald-500"
+                :style="{
+                  height: `${Math.max(
+                    bucket.directUp + bucket.directDown > 0 ? 2 : 0,
+                    ((bucket.directUp + bucket.directDown) / historyMaxTotal) *
+                      100,
+                  )}%`,
+                }"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-1.5 flex items-center justify-between text-[10px] text-gray-400">
+          <span>{{ historyBuckets[0]?.label }}</span>
+          <span>{{ historyBuckets[Math.floor(historyBuckets.length / 2)]?.label }}</span>
+          <span>{{ historyBuckets[historyBuckets.length - 1]?.label }}</span>
+        </div>
+      </div>
+
+      <div
+        v-else
+        class="rounded-xl border border-dashed border-gray-200 py-8 text-center text-[12.5px] text-gray-400"
+      >
+        {{ t("traffic.historyEmpty") }}
+      </div>
+    </div>
+
     <div class="antify-card overflow-hidden p-4">
       <div class="mb-3 flex items-center justify-between gap-3">
         <div class="inline-flex rounded-lg bg-[#EFEFF2] p-0.5 text-[12.5px]">
           <button
             v-for="tab in [
-              { id: 'rule', label: '规则' },
-              { id: 'proxy', label: '代理' },
-              { id: 'app', label: '应用' },
-              { id: 'host', label: '主机' },
+              { id: 'rule', label: t('traffic.tabRule') },
+              { id: 'proxy', label: t('traffic.tabProxy') },
+              { id: 'app', label: t('traffic.tabApp') },
+              { id: 'host', label: t('traffic.tabHost') },
             ]"
             :key="tab.id"
             type="button"
@@ -482,17 +660,17 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
         </div>
 
         <span class="text-[11.5px] text-gray-400">
-          基于当前会话缓存连接统计
+          {{ t("traffic.sessionScope") }}
         </span>
       </div>
 
       <div
         class="grid grid-cols-[1.8fr_0.7fr_0.7fr_0.5fr] items-center gap-2 border-b border-gray-100 px-3 pb-2 text-[11.5px] font-medium text-gray-400"
       >
-        <span>名称</span>
-        <span class="text-right">上传</span>
-        <span class="text-right">下载</span>
-        <span class="text-right">连接</span>
+        <span>{{ t("traffic.colName") }}</span>
+        <span class="text-right">{{ t("traffic.colUp") }}</span>
+        <span class="text-right">{{ t("traffic.colDown") }}</span>
+        <span class="text-right">{{ t("traffic.colConns") }}</span>
       </div>
 
       <div class="divide-y divide-gray-100/80">
@@ -517,7 +695,7 @@ const breakdownRows = computed<BreakdownRow[]>(() => {
           v-if="breakdownRows.length === 0"
           class="py-8 text-center text-[12.5px] text-gray-400"
         >
-          暂无会话流量明细
+          {{ t("traffic.breakdownEmpty") }}
         </div>
       </div>
     </div>

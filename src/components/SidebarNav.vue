@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, type Component } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, type Component } from "vue";
 import {
   Activity,
   ArrowLeftRight,
   BarChart3,
+  ChevronLeft,
+  ChevronRight,
   Gauge,
   Github,
   Layers,
@@ -18,16 +20,43 @@ import {
 } from "lucide-vue-next";
 import { useAppStore } from "@/stores/app";
 import { SKINS, useTheme } from "@/composables/useTheme";
+import { useI18n } from "@/i18n";
 import type { NavRouteId, ThemeMode } from "@/types";
 import ToggleSwitch from "./ToggleSwitch.vue";
 
 const store = useAppStore();
 const { skin, themeMode, setThemeMode, setSkin } = useTheme();
+const { t } = useI18n();
+
+const manualCollapsed = ref<boolean | null>(null);
+const narrowViewport = ref<boolean>(
+  typeof window !== "undefined" ? window.innerWidth < 1020 : false,
+);
+
+const collapsed = computed(() =>
+  manualCollapsed.value !== null ? manualCollapsed.value : narrowViewport.value,
+);
+
+function handleResize() {
+  narrowViewport.value = window.innerWidth < 1020;
+}
+
+onMounted(() => {
+  window.addEventListener("resize", handleResize);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", handleResize);
+});
+
+function toggleCollapsed() {
+  manualCollapsed.value = !collapsed.value;
+}
 
 const themeBadgeLabel = computed(() => {
-  if (themeMode.value === "dark") return "深色";
-  if (themeMode.value === "system") return "自动";
-  return "浅色";
+  if (themeMode.value === "dark") return t("sidebar.themeDark");
+  if (themeMode.value === "system") return t("sidebar.themeAuto");
+  return t("sidebar.themeLight");
 });
 
 function cycleThemeMode() {
@@ -38,85 +67,104 @@ function cycleThemeMode() {
 
 interface NavItem {
   id: NavRouteId;
-  label: string;
+  labelKey: string;
   icon: Component;
 }
 
 interface NavSection {
-  title?: string;
+  titleKey?: string;
   items: NavItem[];
 }
 
 const sections: NavSection[] = [
   {
-    items: [{ id: "dashboard", label: "仪表盘", icon: Gauge }],
+    items: [{ id: "dashboard", labelKey: "nav.dashboard", icon: Gauge }],
   },
   {
-    title: "配置",
+    titleKey: "nav.groupConfig",
     items: [
-      { id: "proxies", label: "代理", icon: Server },
-      { id: "rules", label: "规则", icon: ListChecks },
-      { id: "profiles", label: "配置", icon: Layers },
+      { id: "proxies", labelKey: "nav.proxies", icon: Server },
+      { id: "rules", labelKey: "nav.rules", icon: ListChecks },
+      { id: "profiles", labelKey: "nav.profiles", icon: Layers },
     ],
   },
   {
-    title: "自动化",
-    items: [{ id: "automation", label: "自动化", icon: Radio }],
+    titleKey: "nav.groupAutomation",
+    items: [{ id: "automation", labelKey: "nav.automation", icon: Radio }],
   },
   {
-    title: "监控",
+    titleKey: "nav.groupMonitor",
     items: [
-      { id: "connections", label: "连接", icon: ArrowLeftRight },
-      { id: "traffic", label: "流量", icon: BarChart3 },
-      { id: "activity", label: "活动", icon: Activity },
+      { id: "connections", labelKey: "nav.connections", icon: ArrowLeftRight },
+      { id: "traffic", labelKey: "nav.traffic", icon: BarChart3 },
+      { id: "activity", labelKey: "nav.activity", icon: Activity },
     ],
   },
   {
-    items: [{ id: "settings", label: "设置", icon: Settings }],
+    items: [{ id: "settings", labelKey: "nav.settings", icon: Settings }],
   },
 ];
 </script>
 
 <template>
   <aside
-    class="flex h-full w-[200px] shrink-0 select-none flex-col justify-between border-r border-gray-200/80 bg-[#F2F3F6]/90 px-3 py-4 transition-colors duration-200 dark:border-white/[0.06] dark:bg-[#16181D]"
+    class="flex h-full shrink-0 select-none flex-col justify-between border-r border-gray-200/80 bg-[#F2F3F6]/90 py-4 transition-all duration-200 dark:border-white/[0.06] dark:bg-[#16181D]"
+    :class="collapsed ? 'w-[68px] px-2' : 'w-[200px] px-3'"
   >
     <div>
-      <!-- Brand Header -->
-      <div class="mb-4 flex items-center gap-2.5 px-2.5">
-        <div
-          class="flex h-7 w-7 items-center justify-center rounded-lg text-white shadow-sm"
-          style="background: linear-gradient(135deg, var(--accent), var(--accent-hover))"
-        >
-          <Shield class="h-4 w-4" />
-        </div>
-        <div class="min-w-0">
-          <div class="truncate text-[14px] font-semibold tracking-tight text-gray-900">
-            MyWinAntify
+      <!-- Brand Header + Collapse Toggle -->
+      <div
+        class="mb-4 flex items-center"
+        :class="collapsed ? 'justify-center gap-1' : 'justify-between px-2.5'"
+      >
+        <div class="flex min-w-0 items-center gap-2.5">
+          <div
+            class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white shadow-sm"
+            style="background: linear-gradient(135deg, var(--accent), var(--accent-hover))"
+            title="MyWinAntify"
+          >
+            <Shield class="h-4 w-4" />
+          </div>
+          <div v-if="!collapsed" class="min-w-0">
+            <div class="truncate text-[14px] font-semibold tracking-tight text-gray-900">
+              MyWinAntify
+            </div>
           </div>
         </div>
+
+        <button
+          type="button"
+          :title="collapsed ? t('sidebar.expand') : t('sidebar.collapse')"
+          class="rounded-md p-1 text-gray-400 transition hover:bg-black/5 hover:text-gray-700"
+          @click="toggleCollapsed"
+        >
+          <ChevronRight v-if="collapsed" class="h-3.5 w-3.5" />
+          <ChevronLeft v-else class="h-3.5 w-3.5" />
+        </button>
       </div>
 
       <!-- Navigation Groups -->
       <nav class="space-y-3.5">
         <div v-for="(sec, sIdx) in sections" :key="sIdx">
           <div
-            v-if="sec.title"
+            v-if="sec.titleKey && !collapsed"
             class="mb-1 px-2.5 text-[11px] font-medium text-gray-400"
           >
-            {{ sec.title }}
+            {{ t(sec.titleKey) }}
           </div>
           <div class="space-y-0.5">
             <button
               v-for="item in sec.items"
               :key="item.id"
               type="button"
-              class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0A7AFF]/40"
-              :class="
+              :title="collapsed ? t(item.labelKey) : undefined"
+              class="flex w-full items-center rounded-lg py-1.5 text-left text-[13px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0A7AFF]/40"
+              :class="[
+                collapsed ? 'justify-center px-1.5' : 'gap-2.5 px-2.5',
                 store.activeRoute === item.id
                   ? 'bg-[#0A7AFF] text-white shadow-xs'
-                  : 'text-gray-700 hover:bg-black/[0.045]'
-              "
+                  : 'text-gray-700 hover:bg-black/[0.045]',
+              ]"
               @click="store.activeRoute = item.id"
             >
               <component
@@ -126,7 +174,7 @@ const sections: NavSection[] = [
                   store.activeRoute === item.id ? 'text-white' : 'text-[#0A7AFF]'
                 "
               />
-              <span class="truncate">{{ item.label }}</span>
+              <span v-if="!collapsed" class="truncate">{{ t(item.labelKey) }}</span>
             </button>
           </div>
         </div>
@@ -136,11 +184,12 @@ const sections: NavSection[] = [
     <!-- Footer Status & Theme/Skin & Mock Preview -->
     <div class="space-y-2 border-t border-gray-200/70 pt-3 dark:border-white/[0.06]">
       <div
-        class="flex items-center justify-between rounded-lg bg-white/75 px-2 py-1.5 text-[11px] text-gray-600 dark:bg-[#1C1E24] dark:text-gray-300"
+        class="flex items-center rounded-lg bg-white/75 px-2 py-1.5 text-[11px] text-gray-600 dark:bg-[#1C1E24] dark:text-gray-300"
+        :class="collapsed ? 'justify-center' : 'justify-between'"
       >
         <button
           type="button"
-          title="切换浅色 / 深色 / 跟随系统"
+          :title="t('sidebar.themeCycleTitle')"
           class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium text-gray-700 transition hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-[#252830]"
           @click="cycleThemeMode"
         >
@@ -150,15 +199,15 @@ const sections: NavSection[] = [
             class="h-3.5 w-3.5 text-[#0A7AFF]"
           />
           <Sun v-else class="h-3.5 w-3.5 text-amber-500" />
-          <span>{{ themeBadgeLabel }}</span>
+          <span v-if="!collapsed">{{ themeBadgeLabel }}</span>
         </button>
 
-        <div class="flex items-center gap-1.5">
+        <div v-if="!collapsed" class="flex items-center gap-1.5">
           <button
             v-for="item in SKINS"
             :key="item.id"
             type="button"
-            :title="`切换皮肤：${item.label}`"
+            :title="`${t('sidebar.skinPrefix')}${item.label}`"
             class="h-3 w-3 rounded-full transition-transform hover:scale-110 focus:outline-none"
             :class="
               skin === item.id
@@ -172,9 +221,10 @@ const sections: NavSection[] = [
       </div>
 
       <div
+        v-if="!collapsed"
         class="flex items-center justify-between rounded-lg bg-white/75 px-2.5 py-1.5 text-[11px] text-gray-600 dark:bg-[#1C1E24]"
       >
-        <span class="font-medium">Mock 预览</span>
+        <span class="font-medium">{{ t("sidebar.mockPreview") }}</span>
         <ToggleSwitch
           size="sm"
           :model-value="store.mockMode"
@@ -182,8 +232,20 @@ const sections: NavSection[] = [
         />
       </div>
 
-      <div class="flex items-center justify-between px-2 text-[11px] text-gray-500">
-        <span class="flex items-center gap-1.5">
+      <div
+        class="flex items-center px-2 text-[11px] text-gray-500"
+        :class="collapsed ? 'justify-center' : 'justify-between'"
+      >
+        <span
+          class="flex items-center gap-1.5"
+          :title="
+            store.mockMode
+              ? t('sidebar.offlinePreview')
+              : store.pipeState === 'connected'
+                ? t('sidebar.serviceConnected')
+                : t('sidebar.serviceDisconnected')
+          "
+        >
           <span
             class="h-2 w-2 rounded-full"
             :class="
@@ -194,19 +256,19 @@ const sections: NavSection[] = [
                   : 'bg-gray-300'
             "
           />
-          <span>
+          <span v-if="!collapsed">
             {{
               store.mockMode
-                ? "离线预览"
+                ? t("sidebar.offlinePreview")
                 : store.pipeState === "connected"
-                  ? "服务已连接"
-                  : "未连接服务"
+                  ? t("sidebar.serviceConnected")
+                  : t("sidebar.serviceDisconnected")
             }}
           </span>
         </span>
-        <span class="inline-flex items-center gap-1 text-gray-400">
+        <span v-if="!collapsed" class="inline-flex items-center gap-1 text-gray-400">
           <Github class="h-3.5 w-3.5" />
-          <span>v0.1</span>
+          <span>v0.5</span>
         </span>
       </div>
     </div>

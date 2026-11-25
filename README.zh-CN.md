@@ -34,11 +34,11 @@
 > 首次运行后，程序只会在你自己的电脑上自动生成一份空白默认配置（`%ProgramData%\MyWinAntify\config.json`）。
 
 ### 使用步骤
-1. 前往本仓库 [Releases](../../releases) 页面下载 `MyWinAntify-v0.1.0-win-x64.zip`。
+1. 前往本仓库 [Releases](../../releases) 页面下载 `MyWinAntify-v0.5.0-win-x64.zip`。
 2. 将压缩包**完整解压到本地文件夹**（请勿直接在压缩包预览窗口中双击运行）。
 3. 双击运行 `MyWinAntify.exe`：
    - 启动时会弹出一次 Windows **管理员权限（UAC）授权提示**，点击「是」，桌面端会在后台静默拉起核心引擎（`core-service.exe`）并加载 WinDivert 驱动，无黑框弹窗。
-4. **添加上游代理**：进入左侧「代理」页面，点击右上角 `+`，添加你本地或自建的 SOCKS5 上游代理（例如 Clash / FlClash / v2rayN 开放的 `127.0.0.1:7890`）。
+4. **添加上游代理**：进入左侧「代理」页面，点击右上角 `+`，添加你本地或自建的 `SOCKS5 / HTTP / HTTPS / 接口直连` 节点（例如 Clash / FlClash / v2rayN 开放的 `127.0.0.1:7890`）。
 5. **配置应用规则**：进入「规则」页面，点击 `+`，可以通过浏览选择 `.exe` 文件，或直接从「当前运行进程列表」中一键勾选需要代理的应用，设置动作为「代理 / 直连 / 阻断」。
 6. **开始使用**：回到「仪表盘」，点击「启动」。命中规则的应用流量会经由指定上游代理转发，其余应用保持直连。
 7. **彻底退出**：点击窗口右上角 `×` 会最小化到系统托盘继续代理；如需彻底关闭并立即恢复系统直连，请**右键点击系统托盘图标 -> 选择「退出 MyWinAntify」**。
@@ -50,25 +50,26 @@
 
 ---
 
-## 已实现特性（v0.1.0）
+## 已实现特性（v0.5.0）
 
-- **无虚拟网卡（非 TUN 模式）**：采用 WinDivert 2.2.2-A 官方签名驱动实现 `FLOW` + `NETWORK` 双层反射接管，不安装任何虚拟网卡，可与 Clash / FlClash / v2rayN 等工具和平共存。
-- **按应用精细分流**：支持按可执行文件路径、进程名、目录匹配规则，支持 `Proxy`（代理）、`Direct`（直连）、`Block`（注入 TCP RST 快速失败阻断）三种动作，以及按目标域名/IP/端口过滤。
-- **子进程继承（`includeChildren`）**：自动追溯父进程链，IDE、终端或启动器拉起的子进程（如语言服务、`node.exe`、`curl.exe` 等）可自动继承父级规则。
-- **网络锁（`networkLock`）**：上游代理不可达或拒绝连接时直接断开本地连接，严禁静默回退直连，避免流量泄漏。
-- **轻量域名嗅探（TLS SNI / HTTP Host）**：本地 Tokio 中继对首包执行非破坏性 `peek()`，解析 TLS SNI 或 HTTP `Host`，在连接监控页展示域名并在 SOCKS5 `CONNECT` 时优先传递域名（`ATYP = 0x03`）。
+- **无虚拟网卡（非 TUN 模式）**：采用 WinDivert 2.2.2-A 官方签名驱动实现 `FLOW` + `NETWORK` 双层反射接管，不安装任何虚拟网卡，可与 Clash / FlClash / v2rayN 等工具和平共存。支持 IPv4 TCP + UDP（`SOCKS5 UDP ASSOCIATE`，上游不支持 UDP 时自动将 53 端口 DNS 回退为 DNS-over-TCP 防泄漏）及 IPv6 快速 TCP RST 回退。
+- **多上游协议支持**：支持 `SOCKS5`、`HTTP CONNECT`、`HTTPS CONNECT`（支持 TLS 证书校验与显式跳过开关 `skipTlsVerify`）以及「接口直连（Direct Interface）」（直接绑定指定本机网卡出口）。
+- **精细分流与安全机制**：支持按可执行文件路径、进程名、目录匹配，目标域名/IP/端口过滤与 `-` 排除项、子进程继承（`includeChildren`）、「保持真实 IP」（`bypassHosts`）、`allowLan` 私网开关、网络锁（`networkLock`）、异常规则 Fail-Closed 保护、3 份滚动配置备份与损坏恢复，以及停止引擎/规则热更新瞬间零挂起取消。
+- **真实健康评分与自动恢复**：基于真实流量统计的代理健康分与端到端探测延迟，结合 Windows 睡眠唤醒（`PBT_APMRESUMEAUTOMATIC`）与网卡变更事件自动恢复连接。
+- **自动化、历史统计与诊断**：支持 Windows Wi-Fi SSID 自动切换配置、24 小时 / 本月持久化历史流量柱状图、完整配置备份恢复与便携规则 JSON 导入导出（自动将 `%USERPROFILE%` 路径脱敏）、系统代理 / TUN 共存冲突检测，以及脱敏诊断报告导出。
+- **轻量域名嗅探（TLS SNI / HTTP Host）**：本地 Tokio 中继对首包执行非破坏性 `peek()`，解析 TLS SNI 或 HTTP `Host`，在连接监控页展示域名并在上游握手时优先传递域名（`ATYP = 0x03`）。
 - **特权服务与桌面壳分离**：`core-service.exe` 负责底层引擎与单一配置文件读写；`MyWinAntify.exe` 以普通权限运行，通过带 DACL 安全控制的 Named Pipe（`\\.\pipe\my-win-antify-core-v1`）通信。
-- **主题与离线 Mock 预览**：支持浅色 / 深色 / 跟随系统外观、多套强调色皮肤、实时连接监控；侧边栏提供「Mock 预览」开关，无需开启核心服务即可体验界面交互。
+- **桌面体验与中英双语**：支持单实例防多开、可选开机自启、规则/代理拖拽调序、连接路由诊断与 10 分钟自动关闭的探索模式、按秒去重且可划选的活动日志、可折叠侧边栏与窄窗口自适应、托盘低占用休眠模式、首次启动 3 步轻引导、内置第三方许可证查看器，以及应用内 简体中文 / English 实时切换。
 
 ---
 
 ## 当前不完善之处 / 已知局限
 
-当前仅为 **v0.1.0 个人学习原型版本**，存在以下已知不足：
+当前仍为**个人学习原型版本**，存在以下已知局限：
 
-1. **仅覆盖 IPv4 TCP 与 SOCKS5 上游**：UDP（`SOCKS5 UDP ASSOCIATE`）、IPv6 流量接管以及上游 HTTP CONNECT 代理类型尚未实现。
-2. **部分页面为框架占位**：历史流量柱状图、Wi-Fi 自动化切换配置、配置导入导出、Windows Service (SCM) 服务注册等功能尚未完成。
-3. **复杂环境兼容性**：在多网卡、QUIC/UDP 回退或受保护进程等场景下仍可能存在未覆盖到的边缘问题。
+1. **尚未经过大规模生产验证**：P0–P3 主体功能已补齐，但复杂真实网络环境下的边缘稳定性仍有打磨空间。
+2. **IPv6 接管与 Windows SCM 服务**：命中代理规则的 IPv6 流量目前采用 TCP RST 回退 IPv4，尚未提供完整 IPv6 透明中继；Windows Service (SCM) 服务注册尚未实现。
+3. **复杂环境兼容性**：在多网卡、QUIC/UDP 回退或反作弊/受保护进程等场景下仍可能存在未覆盖到的边缘问题。
 
 ---
 
@@ -92,7 +93,7 @@ npm run build
 # 3. 运行 Rust 工作区单元测试
 cargo test --workspace
 
-# 4. 打包 Windows x64 便携绿色版（生成 release/MyWinAntify-v0.1.0-win-x64.zip）
+# 4. 打包 Windows x64 便携绿色版（生成 release/MyWinAntify-v0.5.0-win-x64.zip）
 npm run package
 ```
 

@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use shared::{AppConfig, ProxyConfig, Rule, RuleAction, RuleMatcher, RunningProcessInfo};
+use shared::{AppConfig, ProxyConfig, RuleAction, RuleMatcher, RunningProcessInfo};
 
 use crate::{
     packet::{FlowKey, FlowKeyV6},
@@ -61,7 +61,7 @@ impl Process {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Decision {
     pub action: RuleAction,
     pub rule_id: Option<String>,
@@ -72,6 +72,21 @@ pub(crate) struct Decision {
 }
 
 impl Decision {
+    pub fn match_reason(&self) -> String {
+        match (self.action, &self.rule_name) {
+            (RuleAction::Block, Some(name)) => format!("Blocked by rule: {name}"),
+            (RuleAction::Block, None) => "Blocked by profile default".into(),
+            (_, Some(name)) => format!("Matched rule: {name}"),
+            (_, None) => "Profile default action".into(),
+        }
+    }
+
+    pub fn use_direct(&mut self) {
+        self.action = RuleAction::Direct;
+        self.proxy = None;
+        self.pending_hosts = None;
+    }
+
     pub fn direct() -> Self {
         Self {
             action: RuleAction::Direct,
@@ -85,7 +100,7 @@ impl Decision {
 }
 
 pub(crate) struct Rules {
-    rules: Vec<(Matcher, Targets, Decision)>,
+    rules: Vec<(Matcher, Option<Targets>, Decision)>,
     default: Decision,
 }
 
@@ -148,16 +163,24 @@ impl Rules {
             .rules
             .iter()
             .filter(|rule| rule.enabled && rule.profile_id == profile.id)
+            .map(|rule| (rule, Targets::parse(rule).ok()))
             .collect();
-        rules.sort_by_key(|rule| rule.priority);
+        // A malformed destination filter must block the matching process even if an
+        // earlier valid rule would otherwise route it.
+        rules.sort_by_key(|(rule, targets)| (targets.is_some(), rule.priority));
         let rules = rules
             .into_iter()
-            .map(|rule: &Rule| {
+            .map(|(rule, targets)| {
+                let action = if targets.is_some() {
+                    rule.action
+                } else {
+                    RuleAction::Block
+                };
                 let decision = Decision {
-                    action: rule.action,
+                    action,
                     rule_id: Some(rule.id.clone()),
                     rule_name: Some(rule.name.clone()),
-                    proxy: if rule.action == RuleAction::Proxy {
+                    proxy: if action == RuleAction::Proxy {
                         proxy(rule.proxy_id.as_deref())
                     } else {
                         None
@@ -165,7 +188,6 @@ impl Rules {
                     network_lock: rule.network_lock,
                     pending_hosts: None,
                 };
-                let targets = Targets::parse(rule).expect("validated rule destinations");
                 (Matcher::compile(&rule.matcher), targets, decision)
             })
             .collect();
@@ -187,7 +209,9 @@ impl Rules {
         self.rules
             .iter()
             .find(|(matcher, targets, _)| {
-                targets.check_ipv6(remote_port)
+                targets
+                    .as_ref()
+                    .is_none_or(|targets| targets.check_ipv6(remote_port))
                     && lineage
                         .iter()
                         .enumerate()
@@ -197,10 +221,42 @@ impl Rules {
     }
 
     pub fn decide(&self, lineage: &[Process], remote: SocketAddrV4) -> Decision {
+        self.decide_destination(lineage, remote, None)
+    }
+
+    pub fn decide_datagram(
+        &self,
+        lineage: &[Process],
+        remote: SocketAddrV4,
+        domain: Option<&str>,
+    ) -> Decision {
+        self.decide_destination(lineage, remote, Some(domain))
+    }
+
+    fn decide_destination(
+        &self,
+        lineage: &[Process],
+        remote: SocketAddrV4,
+        inspected_domain: Option<Option<&str>>,
+    ) -> Decision {
         self.rules
             .iter()
             .find_map(|(matcher, targets, decision)| {
-                let pending_hosts = targets.check(*remote.ip(), remote.port())?;
+                let pending_hosts = match targets {
+                    Some(targets) => targets.check(*remote.ip(), remote.port())?,
+                    None => None,
+                };
+                let pending_hosts = if let Some(domain) = inspected_domain {
+                    if pending_hosts
+                        .as_ref()
+                        .is_some_and(|hosts| !hosts.matches(*remote.ip(), domain))
+                    {
+                        return None;
+                    }
+                    None
+                } else {
+                    pending_hosts
+                };
                 lineage
                     .iter()
                     .enumerate()
@@ -564,6 +620,15 @@ extern "system" {
         class: i32,
         reserved: u32,
     ) -> u32;
+    fn GetExtendedUdpTable(
+        table: *mut c_void,
+        size: *mut u32,
+        sort: i32,
+        family: u32,
+        class: i32,
+        reserved: u32,
+    ) -> u32;
+
 }
 
 fn tcp_rows(family: AddressFamily) -> io::Result<Vec<TcpRow>> {
@@ -599,6 +664,84 @@ fn tcp_rows(family: AddressFamily) -> io::Result<Vec<TcpRow>> {
         io::ErrorKind::WouldBlock,
         "TCP table changed during lookup",
     ))
+}
+
+pub(crate) fn find_udp_owner(local: SocketAddrV4) -> Option<u32> {
+    let (exact_v4, wildcard_v4) = udp_owner_rows(local, AddressFamily::Ipv4);
+    if exact_v4.is_some() {
+        return exact_v4;
+    }
+    let (exact_v6, wildcard_v6) = udp_owner_rows(local, AddressFamily::Ipv6);
+    exact_v6.or(wildcard_v4).or(wildcard_v6)
+}
+
+fn udp_owner_rows(local: SocketAddrV4, family: AddressFamily) -> (Option<u32>, Option<u32>) {
+    const UDP_TABLE_OWNER_PID: i32 = 1;
+    let mut storage = Vec::<u32>::new();
+    for _ in 0..5 {
+        let mut bytes = (storage.len() * size_of::<u32>()) as u32;
+        let buffer = if storage.is_empty() {
+            ptr::null_mut()
+        } else {
+            storage.as_mut_ptr().cast()
+        };
+        match unsafe {
+            GetExtendedUdpTable(
+                buffer,
+                &mut bytes,
+                0,
+                family.number(),
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        } {
+            122 => storage.resize((bytes as usize).div_ceil(size_of::<u32>()), 0),
+            0 if !storage.is_empty() => {
+                let width = match family {
+                    AddressFamily::Ipv4 => 3,
+                    AddressFamily::Ipv6 => 7,
+                };
+                let count = storage[0] as usize;
+                if count > (storage.len() - 1) / width {
+                    break;
+                }
+                let mut wildcard = None;
+                for row in storage[1..1 + count * width].chunks_exact(width) {
+                    let pid = row[width - 1];
+                    let port = u16::from_be(row[width - 2] as u16);
+                    if pid == 0 || port != local.port() {
+                        continue;
+                    }
+                    let ip = match family {
+                        AddressFamily::Ipv4 => Ipv4Addr::from(row[0].to_ne_bytes()),
+                        AddressFamily::Ipv6 => {
+                            let mut bytes = [0; 16];
+                            for (chunk, word) in bytes.chunks_exact_mut(4).zip(row) {
+                                chunk.copy_from_slice(&word.to_ne_bytes());
+                            }
+                            let ip = Ipv6Addr::from(bytes);
+                            if ip.is_unspecified() {
+                                Ipv4Addr::UNSPECIFIED
+                            } else if let Some(mapped) = ip.to_ipv4_mapped() {
+                                mapped
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+                    if &ip == local.ip() {
+                        return (Some(pid), wildcard);
+                    }
+                    if ip.is_unspecified() {
+                        wildcard = Some(pid);
+                    }
+                }
+                return (None, wildcard);
+            }
+            _ => break,
+        }
+    }
+    (None, None)
 }
 
 pub(crate) fn find_tcp_owner(key: FlowKey) -> Option<u32> {
@@ -638,6 +781,7 @@ pub(crate) fn find_tcp_owner_v6(key: FlowKeyV6) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::Rule;
 
     fn rule(id: &str, matcher: RuleMatcher, priority: i32, action: RuleAction) -> Rule {
         Rule {
@@ -869,6 +1013,15 @@ mod tests {
                 remote: "203.0.113.2:443".parse().unwrap(),
             }
         );
+    }
+
+    #[test]
+    fn finds_pid_for_wildcard_and_exact_ipv4_udp_sockets() {
+        for address in ["127.0.0.1:0", "0.0.0.0:0"] {
+            let socket = std::net::UdpSocket::bind(address).unwrap();
+            let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socket.local_addr().unwrap().port());
+            assert_eq!(find_udp_owner(local), Some(std::process::id()));
+        }
     }
 
     #[tokio::test]

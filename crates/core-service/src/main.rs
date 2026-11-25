@@ -1,10 +1,14 @@
+mod atomic_file;
 mod config;
+mod diagnostics;
 mod engine;
+mod health;
 mod ipc_server;
 mod network_interfaces;
 #[cfg(test)]
 mod network_interfaces_tests;
 mod packet;
+mod power_net;
 mod process;
 mod relay;
 mod service;
@@ -12,6 +16,10 @@ mod sniffer;
 mod socks5;
 mod targets;
 mod telemetry;
+mod traffic_history;
+mod udp;
+mod upstream;
+mod wifi;
 mod windivert;
 
 use std::{
@@ -85,6 +93,8 @@ async fn run(args: CliArgs) -> io::Result<()> {
             ipc_server::run(DEFAULT_PIPE_NAME, pipe, service.clone()).await
         } => result,
         () = service.telemetry_loop() => Ok(()),
+        () = service.monitor_network() => Ok(()),
+        () = service.monitor_wifi() => Ok(()),
         signal = tokio::signal::ctrl_c() => signal,
     };
     service.shutdown().await;

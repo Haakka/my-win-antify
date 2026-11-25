@@ -7,8 +7,8 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const FLOW_FILTER: &CStr = c"outbound and ip and tcp and !loopback";
-pub(crate) const NETWORK_FILTER: &CStr = c"(ip or ipv6) and tcp and !loopback";
+pub(crate) const FLOW_FILTER: &CStr = c"outbound and ip and (tcp or udp) and !loopback";
+pub(crate) const NETWORK_FILTER: &CStr = c"((ip and (tcp or udp)) or (ipv6 and tcp)) and !loopback";
 pub(crate) const NETWORK: i32 = 0;
 pub(crate) const FLOW: i32 = 2;
 pub(crate) const FLOW_FLAGS: u64 = 0x01 | 0x04;
@@ -286,6 +286,35 @@ mod tests {
         assert_eq!(address.interface(), [1, 0]);
         assert_eq!(address.flags, (1 << 20) | (1 << 22));
         assert_ne!(&reset[56..58], &[0, 0]);
+    }
+
+    #[test]
+    fn vendor_checksum_helper_recalculates_inbound_ipv4_udp() {
+        let driver = Driver::load_from(
+            &std::path::Path::new(env!("MY_WIN_ANTIFY_DRIVER_TEST_DIR")).join("WinDivert.dll"),
+        )
+        .unwrap();
+        let mut bytes = crate::packet::build_inbound_udp(
+            "203.0.113.1:53".parse().unwrap(),
+            "192.0.2.1:55000".parse().unwrap(),
+            b"DNS",
+        );
+        let mut address = Address {
+            timestamp: 0,
+            flags: 1 << 17,
+            reserved: 0,
+            data: LayerData { reserved: [0; 8] },
+        };
+        address.make_inbound([5, 0]);
+        driver.recalculate(&mut bytes, &mut address).unwrap();
+        assert_eq!(address.flags, (1 << 21) | (1 << 23));
+        assert_eq!(address.interface(), [5, 0]);
+        assert_ne!(bytes[10..12], [0, 0]);
+        assert_ne!(bytes[26..28], [0, 0]);
+        assert_eq!(
+            crate::packet::UdpPacket::parse(&bytes).unwrap().payload,
+            b"DNS"
+        );
     }
 
     #[test]
