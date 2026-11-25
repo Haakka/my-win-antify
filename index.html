@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MyWinAntify</title>
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("my-win-antify:theme") || "light";
+          var skin = localStorage.getItem("my-win-antify:skin") || "flclash";
+          var prefersDark =
+            window.matchMedia &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var isDark =
+            theme === "dark" || (theme === "system" && prefersDark);
+          var root = document.documentElement;
+          root.classList.toggle("dark", isDark);
+          root.dataset.theme = isDark ? "dark" : "light";
+          root.dataset.skin = skin;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="antialiased selection:bg-blue-500/15">
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

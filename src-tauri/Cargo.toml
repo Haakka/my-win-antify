@@ -1,0 +1,21 @@
+[package]
+name = "my-win-antify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "my_win_antify_lib"
+# The Windows desktop executable links this crate as Rust code.
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+shared.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tokio.workspace = true
+tracing.workspace = true

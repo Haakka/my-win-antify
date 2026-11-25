@@ -1,0 +1,37 @@
+# Rust / Cargo
+/target/
+src-tauri/target/
+src-tauri/gen/
+**/*.rs.bk
+
+# Node / Vite / Frontend
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# IDE & OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs & Temp Handoffs & Portable Releases
+*.log
+*.tmp
+codex-handoff*.md
+release/
+
+# Local reference assets & private dev notes (excluded from public repo)
+eg/
+AGENTS.md
+docs/
+
+# Local runtime configs, secrets & archives (never commit)
+config.json
+*.config.json
+.env
+.env.*
+*.zip
